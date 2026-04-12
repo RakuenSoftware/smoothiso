@@ -1,0 +1,431 @@
+#!/bin/bash
+# smoothiso — Generic Debian-based installer ISO builder.
+#
+# Consumed by project wrappers that export the required variables and then
+# exec this script. Never called directly.
+#
+# Required env vars (set by the project wrapper):
+#   PRODUCT_NAME        Display name, e.g. "SmoothNAS"
+#   PRODUCT_ID          Slug (no spaces), e.g. "smoothnas"
+#   VERSION             ISO version string
+#   HOOKS_DIR           Absolute path to the project's hooks/ directory
+#   CACHE_DIR           Directory for cached upstream ISOs
+#   WORK_DIR            Scratch directory for ISO assembly
+#   ISO_OUTPUT_FILE     Full path to write the output .iso
+#
+# Optional env vars (have defaults):
+#   DEBIAN_SUITE        Debian suite, default "trixie"
+#   ARCH                Architecture, default "amd64"
+#   DEBIAN_MIRROR       Debian mirror, default "http://deb.debian.org/debian"
+#   BOOT_MENU_TITLE     Boot menu label, default "${PRODUCT_NAME} Install"
+#   ISO_LABEL           ISO volume label, default upper-cased PRODUCT_ID
+#
+# Hook interface (all optional — absence is not an error):
+#   $HOOKS_DIR/embed.sh
+#       Called after standard files are staged into the initrd temp dir.
+#       Env: INITRD_TMP (path to temp dir being merged into initrd),
+#            HOOKS_DIR, and all config vars above.
+#       Use this to embed product binaries / assets into the initrd.
+#
+# Prerequisites: xorriso, isolinux, cpio, gzip, file, curl, dpkg-deb, gcc
+set -euo pipefail
+
+SMOOTHISO_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+: "${PRODUCT_NAME:?PRODUCT_NAME must be set by the project wrapper}"
+: "${PRODUCT_ID:?PRODUCT_ID must be set by the project wrapper}"
+: "${VERSION:?VERSION must be set by the project wrapper}"
+: "${HOOKS_DIR:?HOOKS_DIR must be set by the project wrapper}"
+: "${CACHE_DIR:?CACHE_DIR must be set by the project wrapper}"
+: "${WORK_DIR:?WORK_DIR must be set by the project wrapper}"
+: "${ISO_OUTPUT_FILE:?ISO_OUTPUT_FILE must be set by the project wrapper}"
+
+DEBIAN_SUITE="${DEBIAN_SUITE:-trixie}"
+ARCH="${ARCH:-amd64}"
+DEBIAN_MIRROR="${DEBIAN_MIRROR:-http://deb.debian.org/debian}"
+BOOT_MENU_TITLE="${BOOT_MENU_TITLE:-${PRODUCT_NAME} Install}"
+ISO_LABEL="${ISO_LABEL:-$(echo "$PRODUCT_ID" | tr '[:lower:]' '[:upper:]')}"
+
+DEBIAN_ISO_URL="https://cdimage.debian.org/debian-cd/current/${ARCH}/iso-cd/"
+
+# --- Preflight ---
+
+check_prereqs() {
+    local missing=()
+    for cmd in xorriso cpio gzip file curl dpkg-deb gcc; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "ERROR: Missing tools: ${missing[*]}"
+        exit 1
+    fi
+    if [ ! -f /usr/lib/ISOLINUX/isohdpfx.bin ]; then
+        echo "ERROR: /usr/lib/ISOLINUX/isohdpfx.bin not found. Install isolinux."
+        exit 1
+    fi
+}
+
+# --- Download ---
+
+download_iso() {
+    mkdir -p "$CACHE_DIR"
+    local cached="${CACHE_DIR}/debian-netinst.iso"
+    if [ -f "$cached" ]; then
+        echo "Using cached: $cached" >&2
+        echo "$cached"; return
+    fi
+    echo "Finding latest Debian ${DEBIAN_SUITE} netinst (${ARCH})..." >&2
+    local name
+    name=$(curl -sL "$DEBIAN_ISO_URL" \
+        | grep -oP "href=\"debian-[0-9.]+-${ARCH}-netinst\\.iso\"" \
+        | head -1 | tr -d '"' | sed 's/href=//')
+    [ -z "$name" ] && { echo "ERROR: Cannot find netinst ISO" >&2; exit 1; }
+    echo "Downloading $name..." >&2
+    curl -fSL -o "$cached" "${DEBIAN_ISO_URL}${name}"
+    echo "$cached"
+}
+
+# --- Extract only what we need from the ISO ---
+
+extract_iso() {
+    local src="$1"
+    echo "Extracting boot files from ISO..."
+    rm -rf "$WORK_DIR"
+    mkdir -p "$WORK_DIR"
+
+    local tmp_pool
+    tmp_pool=$(mktemp -d)
+
+    xorriso -osirrox on -indev "$src" \
+        -extract /install.${ARCH}   "$WORK_DIR/install.${ARCH}" \
+        -extract /isolinux           "$WORK_DIR/isolinux" \
+        -extract /boot               "$WORK_DIR/boot" \
+        -extract /EFI                "$WORK_DIR/EFI" \
+        -extract /pool               "$tmp_pool/pool" \
+        2>&1
+
+    chmod -R u+w "$WORK_DIR"
+    chmod -R u+w "$tmp_pool"
+
+    POOL_DIR="$tmp_pool/pool"
+}
+
+# --- Stage installer files and kernel modules into initrd ---
+
+setup_initrd() {
+    echo "Injecting modules + installer + hooks into initrd..."
+    local tmp
+    tmp=$(mktemp -d)
+
+    # Extract hardware modules from udebs.
+    local udeb_patterns=(
+        "scsi-core-modules-*-${ARCH}-di_*.udeb"
+        "scsi-modules-*-${ARCH}-di_*.udeb"
+        "sata-modules-*-${ARCH}-di_*.udeb"
+        "nic-modules-*-${ARCH}-di_*.udeb"
+        "nic-shared-modules-*-${ARCH}-di_*.udeb"
+        "pata-modules-*-${ARCH}-di_*.udeb"
+        "md-modules-*-${ARCH}-di_*.udeb"
+        "multipath-modules-*-${ARCH}-di_*.udeb"
+        "ext4-modules-*-${ARCH}-di_*.udeb"
+        "dm-modules-*-${ARCH}-di_*.udeb"
+        "usb-storage-modules-*-${ARCH}-di_*.udeb"
+    )
+
+    for pattern in "${udeb_patterns[@]}"; do
+        local udeb
+        udeb=$(find "${POOL_DIR}" -name "$pattern" | head -1)
+        if [ -n "$udeb" ]; then
+            echo "  Extracting modules from $(basename "$udeb")..."
+            local udeb_tmp
+            udeb_tmp=$(mktemp -d)
+            dpkg-deb -x "$udeb" "$udeb_tmp"
+
+            local kver
+            kver=$(find "$udeb_tmp/lib/modules" -maxdepth 1 -mindepth 1 -type d \
+                -printf '%f\n' 2>/dev/null | head -1)
+            if [ -n "$kver" ]; then
+                local dest="${tmp}/usr/lib/modules/${kver}"
+                mkdir -p "$dest"
+                cp -a --no-clobber -r "$udeb_tmp/lib/modules/${kver}/." "$dest/" \
+                    2>/dev/null || true
+            fi
+
+            rm -rf "$udeb_tmp"
+        fi
+    done
+
+    # Partitioning and filesystem tools.
+    echo "  Extracting partitioning tools from pool..."
+    local pkg_tmp
+    pkg_tmp=$(mktemp -d)
+
+    # Helper: extract a deb/udeb into pkg_tmp, copy binaries/libs to $tmp.
+    extract_bins() {
+        local deb="$1"; shift
+        dpkg-deb -x "$deb" "$pkg_tmp/pkg"
+        for bin in "$@"; do
+            local src
+            src=$(find "$pkg_tmp/pkg" -name "$bin" -type f | head -1)
+            if [ -n "$src" ]; then
+                mkdir -p "${tmp}/usr/sbin"
+                cp "$src" "${tmp}/usr/sbin/${bin}"
+                chmod +x "${tmp}/usr/sbin/${bin}"
+            fi
+        done
+        find "$pkg_tmp/pkg" -name '*.so*' -type f | while read -r lib; do
+            mkdir -p "${tmp}/usr/lib/x86_64-linux-gnu"
+            cp "$lib" "${tmp}/usr/lib/x86_64-linux-gnu/"
+        done
+        if [ -d "$pkg_tmp/pkg/usr/sbin" ]; then
+            find "$pkg_tmp/pkg/usr/sbin" -type l | while read -r link; do
+                local name target
+                name=$(basename "$link")
+                target=$(readlink "$link")
+                mkdir -p "${tmp}/usr/sbin"
+                ln -sf "$target" "${tmp}/usr/sbin/${name}"
+            done || true
+        fi
+        find "$pkg_tmp/pkg" -path '*/lib/*' -type l 2>/dev/null | while read -r link; do
+            local name target
+            name=$(basename "$link")
+            target=$(readlink "$link")
+            mkdir -p "${tmp}/usr/lib/x86_64-linux-gnu"
+            ln -sf "$target" "${tmp}/usr/lib/x86_64-linux-gnu/${name}"
+        done || true
+        rm -rf "$pkg_tmp/pkg"
+    }
+
+    local lvm_udeb; lvm_udeb=$(find "${POOL_DIR}" -name 'lvm2-udeb_*.udeb' | head -1)
+    [ -n "$lvm_udeb" ] && extract_bins "$lvm_udeb" lvm
+
+    local libaio_udeb; libaio_udeb=$(find "${POOL_DIR}" -name 'libaio1-udeb_*.udeb' | head -1)
+    [ -n "$libaio_udeb" ] && extract_bins "$libaio_udeb"
+
+    local dm_udeb; dm_udeb=$(find "${POOL_DIR}" -name 'libdevmapper*-udeb_*.udeb' | head -1)
+    [ -n "$dm_udeb" ] && extract_bins "$dm_udeb"
+
+    local mdadm_udeb; mdadm_udeb=$(find "${POOL_DIR}" -name 'mdadm-udeb_*.udeb' | head -1)
+    [ -n "$mdadm_udeb" ] && extract_bins "$mdadm_udeb" mdadm
+
+    local e2fs_udeb; e2fs_udeb=$(find "${POOL_DIR}" -name 'e2fsprogs-udeb_*.udeb' | head -1)
+    [ -n "$e2fs_udeb" ] && extract_bins "$e2fs_udeb" mke2fs
+
+    local libext2_deb; libext2_deb=$(find "${POOL_DIR}" -name 'libext2fs2t64_*.deb' | head -1)
+    [ -n "$libext2_deb" ] && extract_bins "$libext2_deb"
+
+    local libcomerr_deb; libcomerr_deb=$(find "${POOL_DIR}" -name 'libcom-err2_*.deb' | head -1)
+    [ -n "$libcomerr_deb" ] && extract_bins "$libcomerr_deb"
+
+    local fat_udeb; fat_udeb=$(find "${POOL_DIR}" -name 'dosfstools-udeb_*.udeb' | head -1)
+    [ -n "$fat_udeb" ] && extract_bins "$fat_udeb" mkfs.fat
+    mkdir -p "${tmp}/usr/sbin"
+    ln -sf mkfs.fat "${tmp}/usr/sbin/mkfs.vfat"
+
+    local utillinux_deb; utillinux_deb=$(find "${POOL_DIR}" -name 'util-linux_*.deb' | head -1)
+    if [ -n "$utillinux_deb" ]; then
+        dpkg-deb -x "$utillinux_deb" "$pkg_tmp/pkg"
+        [ -f "$pkg_tmp/pkg/usr/sbin/wipefs" ] && \
+            cp "$pkg_tmp/pkg/usr/sbin/wipefs" "${tmp}/usr/sbin/" && \
+            chmod +x "${tmp}/usr/sbin/wipefs"
+        rm -rf "$pkg_tmp/pkg"
+    fi
+
+    local libstdcpp_deb; libstdcpp_deb=$(find "${POOL_DIR}" -name 'libstdc++6_*.deb' | head -1)
+    [ -n "$libstdcpp_deb" ] && extract_bins "$libstdcpp_deb"
+
+    local gdisk_deb="${CACHE_DIR}/gdisk.deb"
+    if [ ! -f "$gdisk_deb" ]; then
+        echo "  Downloading gdisk..."
+        local gdisk_url="http://deb.debian.org/debian/pool/main/g/gdisk/"
+        local gdisk_name
+        gdisk_name=$(curl -sL "$gdisk_url" \
+            | grep -oP "href=\"gdisk_[^\"]*_${ARCH}\\.deb\"" \
+            | tail -1 | tr -d '"' | sed 's/href=//')
+        if [ -n "$gdisk_name" ]; then
+            curl -fsSL -o "$gdisk_deb" "${gdisk_url}${gdisk_name}"
+        fi
+    fi
+    [ -f "$gdisk_deb" ] && extract_bins "$gdisk_deb" sgdisk || \
+        echo "  WARNING: gdisk not found, sgdisk will not be available"
+
+    local whiptail_deb; whiptail_deb=$(find "${POOL_DIR}" -name 'whiptail_*.deb' | head -1)
+    if [ -n "$whiptail_deb" ]; then
+        dpkg-deb -x "$whiptail_deb" "$pkg_tmp/pkg"
+        mkdir -p "${tmp}/usr/bin"
+        cp "$pkg_tmp/pkg/usr/bin/whiptail" "${tmp}/usr/bin/"
+        chmod +x "${tmp}/usr/bin/whiptail"
+        rm -rf "$pkg_tmp/pkg"
+    else
+        echo "  WARNING: whiptail not found, falling back to text prompts"
+    fi
+
+    local popt_udeb; popt_udeb=$(find "${POOL_DIR}" \
+        -name 'libpopt0-udeb_*.udeb' -o -name 'libpopt0_*.deb' | head -1)
+    [ -n "$popt_udeb" ] && extract_bins "$popt_udeb"
+
+    rm -rf "$pkg_tmp"
+
+    # Bundle debootstrap.
+    local dbs_udeb
+    dbs_udeb=$(find "${POOL_DIR}" -name 'debootstrap-udeb_*_all.udeb' | head -1)
+    if [ -n "$dbs_udeb" ]; then
+        echo "  Bundling debootstrap from $(basename "$dbs_udeb")..."
+        dpkg-deb -x "$dbs_udeb" "$tmp"
+    fi
+
+    # Compile pkgdetails (required by debootstrap).
+    echo "  Building pkgdetails..."
+    local pkgdetails_src="/tmp/pkgdetails.c"
+    curl -fsSL \
+        "https://salsa.debian.org/installer-team/base-installer/-/raw/master/pkgdetails.c" \
+        -o "$pkgdetails_src"
+    mkdir -p "${tmp}/usr/lib/debootstrap"
+    if gcc -static -o "${tmp}/usr/lib/debootstrap/pkgdetails" "$pkgdetails_src"; then
+        echo "  pkgdetails compiled successfully"
+    else
+        echo "  WARNING: pkgdetails compile failed -- debootstrap will need perl"
+    fi
+    rm -f "$pkgdetails_src"
+
+    # Generic installer and firstboot scripts.
+    cp "${SMOOTHISO_DIR}/installer.sh" "${tmp}/smoothiso-installer"
+    chmod +x "${tmp}/smoothiso-installer"
+    cp "${SMOOTHISO_DIR}/firstboot.sh" "${tmp}/smoothiso-firstboot"
+    chmod +x "${tmp}/smoothiso-firstboot"
+
+    # Embed preseed that hands off to the generic installer.
+    cat > "${tmp}/preseed.cfg" << 'PRESEED'
+d-i preseed/early_command string exec /smoothiso-installer < /dev/console > /dev/console 2>&1
+PRESEED
+
+    # Write the product config file read by the installer at runtime.
+    mkdir -p "${tmp}/smoothiso-hooks"
+    cat > "${tmp}/smoothiso-hooks/config.sh" << CONF
+PRODUCT_NAME="${PRODUCT_NAME}"
+PRODUCT_ID="${PRODUCT_ID}"
+PRODUCT_HOSTNAME="${PRODUCT_HOSTNAME:-${PRODUCT_ID}}"
+VG_NAME="${VG_NAME:-${PRODUCT_ID}-vg}"
+DEBIAN_SUITE="${DEBIAN_SUITE}"
+DEBIAN_MIRROR="${DEBIAN_MIRROR}"
+DATA_DIR="${DATA_DIR:-/var/lib/${PRODUCT_ID}}"
+TLS_DIR="${TLS_DIR:-/etc/${PRODUCT_ID}/tls}"
+CONF
+
+    # Copy the project's hooks into the initrd.
+    if [ -d "$HOOKS_DIR" ]; then
+        for hook in embed.sh packages.sh configure.sh firstboot.sh; do
+            if [ -f "${HOOKS_DIR}/${hook}" ]; then
+                cp "${HOOKS_DIR}/${hook}" "${tmp}/smoothiso-hooks/${hook}"
+                chmod +x "${tmp}/smoothiso-hooks/${hook}"
+            fi
+        done
+    fi
+
+    # Call the project embed hook (e.g. to embed product binaries).
+    if [ -f "${HOOKS_DIR}/embed.sh" ]; then
+        echo "  Running project embed hook..."
+        INITRD_TMP="$tmp" bash "${HOOKS_DIR}/embed.sh"
+    fi
+
+    # Merge into stock initrd (extract, overlay, repack).
+    local initrd="${WORK_DIR}/install.${ARCH}/initrd.gz"
+    local initrd_root
+    initrd_root=$(mktemp -d)
+    (cd "$initrd_root" && zcat "$initrd" | cpio -id --quiet 2>/dev/null || true)
+    cp -a "$tmp"/. "$initrd_root"/
+    (cd "$initrd_root" && find . | cpio -o -H newc --quiet 2>/dev/null | gzip) > "$initrd"
+    rm -rf "$initrd_root"
+    rm -rf "$tmp"
+
+    rm -rf "$(dirname "$POOL_DIR")"
+}
+
+# --- Rewrite boot menu ---
+
+setup_boot() {
+    echo "Configuring boot menu..."
+
+    cat > "${WORK_DIR}/isolinux/isolinux.cfg" << EOF
+DEFAULT ${PRODUCT_ID}
+TIMEOUT 50
+PROMPT 1
+MENU TITLE ${PRODUCT_NAME} Installer
+
+LABEL ${PRODUCT_ID}
+    MENU LABEL ${BOOT_MENU_TITLE}
+    MENU DEFAULT
+    kernel /install.${ARCH}/vmlinuz
+    append auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 initrd=/install.${ARCH}/initrd.gz ---
+
+LABEL bootlocal
+    MENU LABEL Boot from first hard disk
+    localboot 0x80
+EOF
+
+    cat > "${WORK_DIR}/boot/grub/grub.cfg" << EOF
+set default=0
+set timeout=5
+
+menuentry "${BOOT_MENU_TITLE}" {
+    linux /install.${ARCH}/vmlinuz auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 ---
+    initrd /install.${ARCH}/initrd.gz
+}
+
+menuentry "Boot from first hard disk" {
+    set root=(hd0)
+    chainloader +1
+}
+EOF
+}
+
+# --- Repack ISO ---
+
+repack_iso() {
+    echo "Repacking ISO..."
+    mkdir -p "$(dirname "$ISO_OUTPUT_FILE")"
+
+    (cd "$WORK_DIR" && find . -type f ! -name md5sum.txt ! -path './isolinux/*' \
+        -exec md5sum {} \; 2>/dev/null) > "${WORK_DIR}/md5sum.txt"
+
+    xorriso -as mkisofs \
+        -o "$ISO_OUTPUT_FILE" \
+        -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
+        -c isolinux/boot.cat \
+        -b isolinux/isolinux.bin \
+        -no-emul-boot \
+        -boot-load-size 4 \
+        -boot-info-table \
+        -eltorito-alt-boot \
+        -e boot/grub/efi.img \
+        -no-emul-boot \
+        -isohybrid-gpt-basdat \
+        -V "${ISO_LABEL} ${VERSION}" \
+        "$WORK_DIR"
+
+    echo ""
+    echo "  ISO: ${ISO_OUTPUT_FILE}"
+    echo "  Size: $(du -h "$ISO_OUTPUT_FILE" | cut -f1)"
+}
+
+# --- Main ---
+
+main() {
+    echo "=== ${PRODUCT_NAME} ISO Builder v${VERSION} ==="
+    check_prereqs
+
+    local src
+    src=$(download_iso)
+
+    extract_iso "$src"
+    setup_initrd
+    setup_boot
+    repack_iso
+
+    rm -rf "$WORK_DIR"
+    echo "Done."
+}
+
+main
