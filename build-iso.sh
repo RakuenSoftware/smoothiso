@@ -19,6 +19,10 @@
 #   DEBIAN_MIRROR       Debian mirror, default "http://deb.debian.org/debian"
 #   BOOT_MENU_TITLE     Boot menu label, default "${PRODUCT_NAME} Install"
 #   ISO_LABEL           ISO volume label, default upper-cased PRODUCT_ID
+#   SMOOTHGUI_FRONTEND_DIR      Installer frontend bundle directory
+#   SMOOTHGUI_FRONTEND_REQUIRED  Set to 1 to require SmoothGUI at runtime (default: 1)
+#   SMOOTHGUI_FRONTEND_PORT      Frontend bind port (default: 8080)
+#   SMOOTHGUI_FRONTEND_BIND      Frontend bind address (default: 0.0.0.0)
 #
 # Hook interface (all optional — absence is not an error):
 #   $HOOKS_DIR/embed.sh
@@ -67,6 +71,210 @@ check_prereqs() {
     fi
 }
 
+collect_apt_deps() {
+    local root_pkg="$1"
+    local out_file="$2"
+    local -A seen
+    local -a queue
+    local pkg
+    local dep_expr
+    local dep
+
+    : > "$out_file"
+    queue=("$root_pkg")
+
+    while [ ${#queue[@]} -gt 0 ]; do
+        pkg="${queue[0]}"
+        queue=("${queue[@]:1}")
+
+        [ -n "${seen["$pkg"]+x}" ] && continue
+        seen["$pkg"]=1
+        printf '%s\n' "$pkg" >> "$out_file"
+
+    while IFS= read -r dep_expr; do
+            dep="${dep_expr%%|*}"
+            dep="$(printf '%s\n' "$dep" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+            [ -z "$dep" ] && continue
+            case "$dep" in
+                "<"*">") continue ;;
+            esac
+            [ -n "${seen["$dep"]+x}" ] || queue+=("$dep")
+        done < <(apt-cache depends "$pkg" 2>/dev/null | \
+            awk -F': ' '/^  (Depends|Pre-Depends): / {print $2}')
+    done
+
+    sort -u "$out_file" -o "$out_file"
+}
+
+install_installer_browser() {
+    local initrd_tmp="$1"
+    local browser_pkg="${INSTALLER_BROWSER_PKG:-firefox-esr}"
+    local aux_pkgs="${INSTALLER_BROWSER_AUX_PKGS:-xvfb xinit x11-utils x11-xserver-utils xserver-xorg-core xserver-xorg-input-libinput xserver-xorg-input-evdev xserver-xorg-video-fbdev xserver-xorg-video-vesa xserver-xorg-video-qxl xserver-xorg-video-all xserver-xorg-input-all xfonts-base xfonts-100dpi xfonts-75dpi libegl1 dbus dbus-x11}"
+    local pkg_cache="${CACHE_DIR}/browser-packages"
+    local dep_file="${pkg_cache}/deps.txt"
+    local selected_file="${pkg_cache}/selected.txt"
+    local root_pkgs="${browser_pkg} ${aux_pkgs}"
+    local root_pkg
+
+    command -v apt-cache >/dev/null 2>&1 || return 0
+    command -v apt-get >/dev/null 2>&1 || return 0
+
+    mkdir -p "$pkg_cache"
+    : > "$dep_file"
+    for root_pkg in $root_pkgs; do
+        local root_dep_file="${pkg_cache}/deps-${root_pkg}.txt"
+        if ! collect_apt_deps "$root_pkg" "$root_dep_file"; then
+            echo "  WARNING: failed to resolve browser dependency list for ${browser_pkg}; continuing without browser."
+            continue
+        fi
+        cat "$root_dep_file" >> "$dep_file"
+    done
+    rm -f "${pkg_cache}/deps-"*.txt 2>/dev/null || true
+    sort -u "$dep_file" -o "$dep_file"
+
+    : > "$selected_file"
+    local -A selected
+    local package
+    while IFS= read -r package; do
+        local targets="${package} ${aux_pkgs}"
+        local target
+        for target in $targets; do
+            [ -z "$target" ] && continue
+
+            shopt -s nullglob
+            local matches=(
+                ${pkg_cache}/${target}_*.deb
+                ${pkg_cache}/${target}-*.deb
+            )
+            shopt -u nullglob
+            if [ "${#matches[@]}" -eq 0 ]; then
+                if (cd "$pkg_cache" && apt-get download --quiet "$target"); then
+                    :
+                else
+                    echo "  WARNING: unable to download ${target}; installer browser may be incomplete."
+                fi
+            fi
+            shopt -s nullglob
+            matches=(
+                ${pkg_cache}/${target}_*.deb
+                ${pkg_cache}/${target}-*.deb
+            )
+            shopt -u nullglob
+            for package_file in "${matches[@]}"; do
+                selected["$package_file"]=1
+            done
+        done
+    done < "$dep_file"
+
+    if [ -n "$aux_pkgs" ]; then
+        local aux
+        for aux in $aux_pkgs; do
+            shopt -s nullglob
+                local aux_matches=(
+                ${pkg_cache}/${aux}_*.deb
+                ${pkg_cache}/${aux}-*.deb
+            )
+            shopt -u nullglob
+            if [ "${#aux_matches[@]}" -eq 0 ]; then
+                if (cd "$pkg_cache" && apt-get download --quiet "$aux"); then
+                    :
+                else
+                    echo "  WARNING: unable to download ${aux}; installer browser may be incomplete."
+                fi
+            fi
+
+            shopt -s nullglob
+            aux_matches=(
+                ${pkg_cache}/${aux}_*.deb
+                ${pkg_cache}/${aux}-*.deb
+            )
+            shopt -u nullglob
+            for package_file in "${aux_matches[@]}"; do
+                selected["$package_file"]=1
+            done
+        done
+    fi
+    : > "$selected_file"
+    for package_file in "${!selected[@]}"; do
+        echo "$package_file" >> "$selected_file"
+    done
+
+    if [ ! -s "$selected_file" ]; then
+        echo "  WARNING: installer browser dependency cache is empty; installer GUI may not launch."
+        return 0
+    fi
+
+    shopt -s nullglob
+    while IFS= read -r package_file; do
+        dpkg-deb -x "$package_file" "$initrd_tmp"
+    done < "$selected_file"
+    shopt -u nullglob
+
+    if [ -x "${initrd_tmp}/usr/bin/${browser_pkg}" ] || \
+       [ -x "${initrd_tmp}/usr/bin/firefox" ]; then
+        echo "  Installed installer browser package(s) from ${browser_pkg}."
+    else
+        echo "  WARNING: installer browser package ${browser_pkg} not available after embedding; installer GUI may not launch."
+    fi
+}
+
+install_full_busybox() {
+    local initrd_tmp="$1"
+    local cache_dir="${CACHE_DIR}/busybox-packages"
+    local busybox_pkg=""
+    local busybox_deb=""
+
+    if ! command -v apt >/dev/null 2>&1; then
+        return 0
+    fi
+
+    mkdir -p "$cache_dir"
+
+    for busybox_pkg in busybox-static busybox; do
+        local extracted busybox_tmp
+        local -a candidates=()
+
+        shopt -s nullglob
+        candidates=(
+            ${cache_dir}/${busybox_pkg}_*amd64.deb
+            ${cache_dir}/${busybox_pkg}_*.deb
+            ${cache_dir}/${busybox_pkg}-*.deb
+        )
+        shopt -u nullglob
+
+        if [ "${#candidates[@]}" -eq 0 ]; then
+            (cd "$cache_dir" && apt download "$busybox_pkg" >/dev/null 2>&1) || {
+                continue
+            }
+            shopt -s nullglob
+            candidates=(
+                ${cache_dir}/${busybox_pkg}_*amd64.deb
+                ${cache_dir}/${busybox_pkg}_*.deb
+                ${cache_dir}/${busybox_pkg}-*.deb
+            )
+            shopt -u nullglob
+            [ "${#candidates[@]}" -eq 0 ] && continue
+        fi
+
+        busybox_deb="${candidates[0]}"
+        extracted="$(mktemp -d)"
+        dpkg-deb -x "$busybox_deb" "$extracted/pkg"
+        if [ -x "$extracted/pkg/usr/bin/busybox" ] && \
+            "$extracted/pkg/usr/bin/busybox" --list 2>/dev/null | grep -q '^httpd$'; then
+            mkdir -p "${initrd_tmp}/usr/bin"
+            cp "$extracted/pkg/usr/bin/busybox" "${initrd_tmp}/usr/bin/busybox"
+            chmod +x "${initrd_tmp}/usr/bin/busybox"
+            rm -rf "$extracted"
+            echo "  Installed BusyBox ${busybox_pkg} (httpd enabled)."
+            return 0
+        fi
+        rm -rf "$extracted"
+    done
+
+    echo "  WARNING: unable to embed a BusyBox build with httpd support."
+    return 0
+}
+
 # --- Download ---
 
 download_iso() {
@@ -95,11 +303,26 @@ extract_iso() {
     rm -rf "$WORK_DIR"
     mkdir -p "$WORK_DIR"
 
+    local install_dir=""
+    local candidate
+    local listing
+    listing=$(xorriso -indev "$src" -ls / 2>/dev/null | sed "s/^[[:space:]]*'\\([^']*\\)'.*$/\\1/")
+    for candidate in "/install.${ARCH}" "/install.amd" "/install"; do
+        if echo "$listing" | rg -q "^${candidate#/}$"; then
+            install_dir="$candidate"
+            break
+        fi
+    done
+    if [ -z "$install_dir" ]; then
+        echo "ERROR: Cannot find installer directory on source ISO."
+        exit 1
+    fi
+
     local tmp_pool
     tmp_pool=$(mktemp -d)
 
     xorriso -osirrox on -indev "$src" \
-        -extract /install.${ARCH}   "$WORK_DIR/install.${ARCH}" \
+        -extract "$install_dir"      "$WORK_DIR/install.${ARCH}" \
         -extract /isolinux           "$WORK_DIR/isolinux" \
         -extract /boot               "$WORK_DIR/boot" \
         -extract /EFI                "$WORK_DIR/EFI" \
@@ -266,6 +489,9 @@ setup_initrd() {
         -name 'libpopt0-udeb_*.udeb' -o -name 'libpopt0_*.deb' | head -1)
     [ -n "$popt_udeb" ] && extract_bins "$popt_udeb"
 
+    install_full_busybox "$tmp"
+    install_installer_browser "$tmp"
+
     rm -rf "$pkg_tmp"
 
     # Bundle debootstrap.
@@ -312,6 +538,10 @@ DEBIAN_SUITE="${DEBIAN_SUITE}"
 DEBIAN_MIRROR="${DEBIAN_MIRROR}"
 DATA_DIR="${DATA_DIR:-/var/lib/${PRODUCT_ID}}"
 TLS_DIR="${TLS_DIR:-/etc/${PRODUCT_ID}/tls}"
+SMOOTHGUI_FRONTEND_DIR="/smoothiso-ui"
+SMOOTHGUI_FRONTEND_REQUIRED="${SMOOTHGUI_FRONTEND_REQUIRED:-1}"
+SMOOTHGUI_FRONTEND_PORT="${SMOOTHGUI_FRONTEND_PORT:-8080}"
+SMOOTHGUI_FRONTEND_BIND="${SMOOTHGUI_FRONTEND_BIND:-0.0.0.0}"
 CONF
 
     # Copy the project's hooks into the initrd.
@@ -324,6 +554,22 @@ CONF
         done
     fi
 
+    # Installer frontend assets.
+    mkdir -p "${tmp}/smoothiso-ui"
+    if [ -n "${SMOOTHGUI_FRONTEND_DIR}" ] && [ -d "${SMOOTHGUI_FRONTEND_DIR}" ]; then
+        cp -a "${SMOOTHGUI_FRONTEND_DIR}/." "${tmp}/smoothiso-ui/"
+        if [ -f "${tmp}/smoothiso-ui/index.installer.html" ]; then
+            cp "${tmp}/smoothiso-ui/index.installer.html" "${tmp}/smoothiso-ui/index.html"
+        fi
+    elif [ -d "${HOOKS_DIR}/ui" ]; then
+        cp -a "${HOOKS_DIR}/ui/." "${tmp}/smoothiso-ui/"
+    fi
+
+    # Shared backend bridge scripts.
+    cp -a "${SMOOTHISO_DIR}/ui-backend/." "${tmp}/smoothiso-ui-backend/"
+    chmod +x "${tmp}/smoothiso-ui-backend/start.sh"
+    chmod +x "${tmp}/smoothiso-ui-backend/request" "${tmp}/smoothiso-ui-backend/respond"
+
     # Call the project embed hook (e.g. to embed product binaries).
     if [ -f "${HOOKS_DIR}/embed.sh" ]; then
         echo "  Running project embed hook..."
@@ -335,7 +581,7 @@ CONF
     local initrd_root
     initrd_root=$(mktemp -d)
     (cd "$initrd_root" && zcat "$initrd" | cpio -id --quiet 2>/dev/null || true)
-    cp -a "$tmp"/. "$initrd_root"/
+    cp -a --remove-destination "$tmp"/. "$initrd_root"/
     (cd "$initrd_root" && find . | cpio -o -H newc --quiet 2>/dev/null | gzip) > "$initrd"
     rm -rf "$initrd_root"
     rm -rf "$tmp"
