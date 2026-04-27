@@ -98,6 +98,17 @@ ui_escape_json() {
 ui_init_frontend() {
     mkdir -p /run || die "Unable to create /run for SmoothGUI state."
 
+    # Bring up the loopback interface before the bridge tries to bind 127.0.0.1.
+    # d-i's early_command runs before any networking step, so lo is created but
+    # still DOWN — bind() then fails with EADDRNOTAVAIL and every backend looks
+    # broken. Doing this here is cheap and idempotent.
+    if command -v ip >/dev/null 2>&1; then
+        ip link set lo up 2>/dev/null || true
+        ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
+    elif command -v ifconfig >/dev/null 2>&1; then
+        ifconfig lo 127.0.0.1 up 2>/dev/null || true
+    fi
+
     if [ -d "$UI_FRONTEND_DIR" ] || [ "$SMOOTHGUI_ENABLE_FRONTEND" = "1" ] \
         || [ -n "${SMOOTHGUI_FRONTEND_DIR:-}" ]; then
         UI_FRONTEND_ENABLED=1
@@ -207,7 +218,10 @@ ui_launch_frontend_viewer_command() {
         firefox_env="DISPLAY=$DISPLAY HOME=$SMOOTHGUI_FIREFOX_HOME XDG_RUNTIME_DIR=$SMOOTHGUI_FIREFOX_RUNTIME"
         firefox_env="$firefox_env MOZ_DISABLE_SAFE_MODE_KEY=1 MOZ_DBUS_SESSION_BUS_ADDRESS=\"$DBUS_SESSION_BUS_ADDRESS\""
         firefox_env="$firefox_env MOZ_X11_EGL=0 MOZ_WEBRENDER=0 MOZ_USE_XINPUT2=0 LIBGL_ALWAYS_SOFTWARE=1 MOZ_DISABLE_WAYLAND=1"
-        launcher_cmd="env $firefox_env exec $rendered"
+        # Note: NO `exec` here. `env A=B exec firefox-esr ...` makes env try to
+        # execve("exec", ...) — exec is a shell builtin, not a binary. Drop it
+        # and let `sh -c` exec the resulting command directly.
+        launcher_cmd="env $firefox_env $rendered"
         escaped_rendered=$(printf '%s' "$launcher_cmd" | sed "s/'/'\\\\''/g")
         if [ -n "$browser_user" ] && command -v runuser >/dev/null 2>&1; then
             launcher_cmd="runuser -u ${browser_user} -- sh -c '$escaped_rendered'"
@@ -314,7 +328,10 @@ ui_ensure_display() {
         local xorg_base_args
         local xorg_driver_conf
 
-        xorg_base_args="-noreset -ac -nolisten tcp -br -novtswitch -screen 0 1280x720 -depth 24 -dpi 96"
+        # Xorg rejects Xvfb-style geometry args (`-screen 0 WxH -depth N` etc.) —
+        # passing them makes Xorg print its help text and exit. Resolution is
+        # configured via the per-driver xorg.conf snippet below instead.
+        xorg_base_args="-noreset -ac -nolisten tcp -br -novtswitch"
 
         for xorg_attempt in vt7 vt1 ""; do
             for xorg_driver in auto vesa modesetting fbdev; do
@@ -326,6 +343,23 @@ ui_ensure_display() {
 Section "Device"
     Identifier "SmoothGUI"
     Driver "${xorg_driver}"
+EndSection
+
+Section "Monitor"
+    Identifier "SmoothGUI-Monitor"
+    HorizSync 28.0-80.0
+    VertRefresh 48.0-75.0
+EndSection
+
+Section "Screen"
+    Identifier "SmoothGUI-Screen"
+    Device "SmoothGUI"
+    Monitor "SmoothGUI-Monitor"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+        Modes "1280x720" "1024x768" "800x600"
+    EndSubSection
 EndSection
 EOF
                 fi

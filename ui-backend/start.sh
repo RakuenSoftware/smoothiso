@@ -8,10 +8,21 @@ FRONTEND_DIR="${UI_FRONTEND_DIR:-${SMOOTHGUI_FRONTEND_DIR:-/smoothiso-ui}}"
 PORT="${SMOOTHGUI_FRONTEND_PORT:-8080}"
 BIND_ADDR="${SMOOTHGUI_FRONTEND_BIND:-0.0.0.0}"
 LOG_FILE="${STATE_DIR}/smoothiso-frontend.log"
+HTTPD_LOG="${STATE_DIR}/smoothiso-httpd.log"
+PYTHON_LOG="${STATE_DIR}/smoothiso-python.log"
+NC_LOG="${STATE_DIR}/smoothiso-nc.log"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 CGI_DIR="${FRONTEND_DIR}/cgi-bin"
 
 mkdir -p "$STATE_DIR" "$REQUEST_DIR" "$RESPONSE_DIR" "$CGI_DIR" "/cgi-bin"
+: > "$LOG_FILE"
+: > "$HTTPD_LOG" 2>/dev/null || true
+: > "$PYTHON_LOG" 2>/dev/null || true
+: > "$NC_LOG" 2>/dev/null || true
+
+log() {
+    printf '%s [start.sh] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo -)" "$*" >> "$LOG_FILE"
+}
 cp "${SCRIPT_DIR}/request" "$CGI_DIR/request" 2>/dev/null || true
 cp "${SCRIPT_DIR}/respond" "$CGI_DIR/respond" 2>/dev/null || true
 ln -sf "${CGI_DIR}/request" "/cgi-bin/request" 2>/dev/null || true
@@ -19,7 +30,10 @@ ln -sf "${CGI_DIR}/respond" "/cgi-bin/respond" 2>/dev/null || true
 chmod +x "$CGI_DIR/request" "$CGI_DIR/respond" "/cgi-bin/request" "/cgi-bin/respond" 2>/dev/null || true
 
 start_python() {
-    command -v python3 >/dev/null 2>&1 || return 1
+    if ! command -v python3 >/dev/null 2>&1; then
+        log "python3 not present; skipping python backend"
+        return 1
+    fi
     cat > /tmp/smoothiso-ui-bridge.py << 'PY'
 import os
 import json
@@ -111,40 +125,45 @@ def main():
 if __name__ == "__main__":
     main()
 PY
-    python3 /tmp/smoothiso-ui-bridge.py >"$LOG_FILE" 2>&1
+    log "starting python3 backend on ${BIND_ADDR}:${PORT}"
+    python3 /tmp/smoothiso-ui-bridge.py >>"$PYTHON_LOG" 2>&1 &
+    local py_pid=$!
+    sleep 1
+    if ! kill -0 "$py_pid" 2>/dev/null; then
+        log "python3 backend died during startup; see ${PYTHON_LOG}"
+        return 1
+    fi
+    log "python3 backend running (pid=$py_pid)"
+    return 0
 }
 
 start_busybox_httpd() {
-    command -v busybox >/dev/null 2>&1 || return 1
+    if ! command -v busybox >/dev/null 2>&1; then
+        log "busybox not on PATH; skipping busybox httpd backend"
+        return 1
+    fi
     if ! busybox --list 2>/dev/null | grep -q '^httpd$'; then
+        log "busybox build lacks httpd applet; skipping"
         return 1
     fi
 
+    # busybox httpd auto-runs executables under cgi-bin/ in the docroot;
+    # `-c` expects a config FILE, not a directory, so we omit it here.
+    # Run in background and verify the listener stays up before returning.
+    log "starting busybox httpd on ${BIND_ADDR}:${PORT} docroot=${FRONTEND_DIR}"
     busybox httpd \
         -f \
+        -vv \
         -p "${BIND_ADDR}:${PORT}" \
         -h "$FRONTEND_DIR" \
-        -c /cgi-bin \
-        >"$LOG_FILE" 2>&1
-}
-
-start_legacy_httpd() {
-    local httpd_path=""
-    if [ -x "/usr/bin/httpd" ]; then
-        httpd_path="/usr/bin/httpd"
-    elif [ -x "/bin/httpd" ]; then
-        httpd_path="/bin/httpd"
-    else
+        >>"$HTTPD_LOG" 2>&1 &
+    local httpd_pid=$!
+    sleep 1
+    if ! kill -0 "$httpd_pid" 2>/dev/null; then
+        log "busybox httpd died during startup; see ${HTTPD_LOG}"
         return 1
     fi
-
-    DOCROOT="$FRONTEND_DIR" \
-        HTTPD_STARTED=1 \
-        PORT="$PORT" \
-        "$httpd_path" >>"$LOG_FILE" 2>&1 &
-    local legacy_pid="$!"
-    sleep 1
-    kill -0 "$legacy_pid" 2>/dev/null || return 1
+    log "busybox httpd running (pid=$httpd_pid)"
     return 0
 }
 
@@ -292,30 +311,70 @@ esac
 SH
 
     chmod +x "$bridge"
-    while true; do
-        if [ "$BIND_ADDR" = "0.0.0.0" ] || [ -z "$BIND_ADDR" ]; then
-            busybox nc -l -p "$PORT" -e "$bridge" >>"$LOG_FILE" 2>&1
-        else
-            busybox nc -l -s "$BIND_ADDR" -p "$PORT" -e "$bridge" >>"$LOG_FILE" 2>&1
-        fi
-    done &
+
+    # Some busybox builds reject `-s` in listen mode (we have seen
+    # `nc: invalid option -- 's'` in the d-i image). Listen mode binds
+    # the port on all interfaces by default; if BIND_ADDR is set to a
+    # specific loopback address we just rely on that default — the
+    # firewall context here is the installer ramdisk, never an external
+    # interface.
+    log "starting busybox nc bridge on ${BIND_ADDR}:${PORT} (single-shot loop)"
+    busybox nc -l -p "$PORT" -e "$bridge" >>"$NC_LOG" 2>&1 &
+    local nc_pid=$!
+    sleep 1
+    if ! kill -0 "$nc_pid" 2>/dev/null; then
+        log "busybox nc died during startup; see ${NC_LOG}"
+        return 1
+    fi
+    log "busybox nc bridge running (pid=$nc_pid)"
+
+    # Respawn nc after each connection finishes (busybox nc -l only handles one).
+    # `wait` won't work across the subshell boundary so we poll with kill -0.
+    (
+        while kill -0 "$nc_pid" 2>/dev/null; do
+            sleep 1
+        done
+        while true; do
+            busybox nc -l -p "$PORT" -e "$bridge" >>"$NC_LOG" 2>&1
+        done
+    ) &
+    return 0
 }
 
+log "ui-backend start: BIND=${BIND_ADDR} PORT=${PORT} FRONTEND_DIR=${FRONTEND_DIR}"
+if [ -e /sys/class/net/lo ] && [ -r /sys/class/net/lo/operstate ]; then
+    log "lo operstate: $(cat /sys/class/net/lo/operstate 2>/dev/null || echo unknown)"
+fi
+if command -v ip >/dev/null 2>&1; then
+    log "interfaces: $(ip -o link 2>/dev/null | tr '\n' ';' | head -c 400)"
+fi
+
 if start_busybox_httpd; then
-    exit 0
-fi
-
-if start_legacy_httpd; then
-    exit 0
-fi
-
-if start_busybox_nc; then
+    log "selected backend: busybox httpd"
+    wait
     exit 0
 fi
 
 if start_python; then
+    log "selected backend: python3"
+    wait
     exit 0
 fi
 
-echo "SmoothGUI frontend backend unavailable; tried busybox httpd, legacy httpd script, busybox nc, and python3." >&2
+if start_busybox_nc; then
+    log "selected backend: busybox nc"
+    wait
+    exit 0
+fi
+
+log "ALL BACKENDS FAILED. Per-backend logs follow."
+log "----- httpd -----"
+[ -s "$HTTPD_LOG" ] && cat "$HTTPD_LOG" >> "$LOG_FILE"
+log "----- python -----"
+[ -s "$PYTHON_LOG" ] && cat "$PYTHON_LOG" >> "$LOG_FILE"
+log "----- nc -----"
+[ -s "$NC_LOG" ] && cat "$NC_LOG" >> "$LOG_FILE"
+log "----- end -----"
+
+echo "SmoothGUI frontend backend unavailable; tried busybox httpd, python3, and busybox nc." >&2
 exit 1
