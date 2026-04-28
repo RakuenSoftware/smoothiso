@@ -42,7 +42,11 @@ UI_FRONTEND_DIR="${SMOOTHGUI_FRONTEND_DIR:-/smoothiso-ui}"
 SMOOTHGUI_FRONTEND_BIND="${SMOOTHGUI_FRONTEND_BIND:-127.0.0.1}"
 SMOOTHGUI_FRONTEND_PORT="${SMOOTHGUI_FRONTEND_PORT:-8080}"
 UI_FRONTEND_BACKEND="${UI_FRONTEND_BACKEND:-/smoothiso-ui-backend/start.sh}"
-UI_FRONTEND_TIMEOUT="${UI_FRONTEND_TIMEOUT:-60}"
+# Blocking interactive prompts (disk-select, password, completion). The
+# operator needs time to read the screen and pick options, so we give a
+# generous 30-minute window before declaring the kiosk dead. Status
+# polling uses UI_REQUEST_TIMEOUT separately.
+UI_FRONTEND_TIMEOUT="${UI_FRONTEND_TIMEOUT:-1800}"
 UI_FRONTEND_ENABLED=0
 UI_FRONTEND_REQUIRED="${SMOOTHGUI_FRONTEND_REQUIRED:-1}"
 UI_FRONTEND_SERVER_PID=""
