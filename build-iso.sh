@@ -601,6 +601,10 @@ PRESEED
 
     # Write the product config file read by the installer at runtime.
     mkdir -p "${tmp}/smoothiso-hooks"
+    # Quote INSTALLER_KERNEL_PACKAGES carefully — the project wrapper
+    # may set it to the empty string to opt out of Debian's kernel,
+    # and we need to preserve that distinction (set-but-empty vs unset)
+    # so installer.sh's `${VAR-default}` expansion respects it.
     cat > "${tmp}/smoothiso-hooks/config.sh" << CONF
 PRODUCT_NAME="${PRODUCT_NAME}"
 PRODUCT_ID="${PRODUCT_ID}"
@@ -614,6 +618,7 @@ SMOOTHGUI_FRONTEND_DIR="/smoothiso-ui"
 SMOOTHGUI_FRONTEND_REQUIRED="${SMOOTHGUI_FRONTEND_REQUIRED:-1}"
 SMOOTHGUI_FRONTEND_PORT="${SMOOTHGUI_FRONTEND_PORT:-8080}"
 SMOOTHGUI_FRONTEND_BIND="${SMOOTHGUI_FRONTEND_BIND:-0.0.0.0}"
+INSTALLER_KERNEL_PACKAGES="${INSTALLER_KERNEL_PACKAGES-linux-image-amd64 linux-headers-amd64}"
 CONF
 
     # Copy the project's hooks into the initrd.

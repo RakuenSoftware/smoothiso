@@ -1639,6 +1639,7 @@ install_base() {
     command -v debootstrap >/dev/null 2>&1 || \
         die "debootstrap not found in initrd -- rebuild ISO"
 
+    ui_status "Installing base system" "Running debootstrap first stage (downloading Debian ${DEBIAN_SUITE}). This takes a few minutes." 2 6
     echo "  Running debootstrap for ${DEBIAN_SUITE}..."
     debootstrap --foreign --arch=amd64 \
         "$DEBIAN_SUITE" "$TARGET" "$DEBIAN_MIRROR" || \
@@ -1663,6 +1664,7 @@ done
 HOOK
     chmod +x "$TARGET/debootstrap/stub-debconf-postinsts"
 
+    ui_status "Installing base system" "Running debootstrap second stage (unpacking and configuring base packages)." 2 6
     echo "  Running debootstrap second stage..."
     DEBIAN_FRONTEND=noninteractive chroot "$TARGET" \
         /debootstrap/debootstrap --second-stage || \
@@ -1681,6 +1683,7 @@ HOOK
     done
 
     if [ -n "$stubbed_pkgs" ]; then
+        ui_status "Installing base system" "Reconfiguring deferred postinst scripts." 2 6
         echo "  Reconfiguring:$stubbed_pkgs"
         mount --bind /dev "$TARGET/dev" 2>/dev/null || true
         mount --bind /dev/pts "$TARGET/dev/pts" 2>/dev/null || true
@@ -1771,8 +1774,10 @@ HOOK
         chmod +x "$TARGET/usr/sbin/pam-auth-update"
     fi
 
+    ui_status "Installing packages" "Refreshing package indexes." 3 6
     chroot "$TARGET" apt-get update -qq
 
+    ui_status "Installing packages" "Installing GRUB bootloader packages." 3 6
     echo "  Installing bootloader packages..."
     DEBIAN_FRONTEND=noninteractive chroot "$TARGET" apt-get install -y \
         grub-efi-amd64 grub-pc-bin efibootmgr \
@@ -1782,6 +1787,7 @@ HOOK
     # INSTALLER_KERNEL_PACKAGES="" and install it from packages.sh.
     local kernel_pkgs="${INSTALLER_KERNEL_PACKAGES-linux-image-amd64 linux-headers-amd64}"
     if [ -n "$kernel_pkgs" ]; then
+        ui_status "Installing packages" "Installing kernel: ${kernel_pkgs}." 3 6
         echo "  Installing kernel packages: ${kernel_pkgs}..."
         # shellcheck disable=SC2086
         DEBIAN_FRONTEND=noninteractive chroot "$TARGET" apt-get install -y -qq \
@@ -1789,6 +1795,7 @@ HOOK
             2>/dev/null || true
     fi
 
+    ui_status "Installing packages" "Installing LVM, mdadm, SSH, and core utilities." 3 6
     echo "  Installing core packages..."
     DEBIAN_FRONTEND=noninteractive chroot "$TARGET" apt-get install -y -qq \
         lvm2 mdadm \
@@ -1798,6 +1805,7 @@ HOOK
         2>/dev/null || true
 
     # Product-specific packages.
+    ui_status "Installing packages" "Installing product-specific packages." 3 6
     if [ -f /smoothiso-hooks/packages.sh ]; then
         echo "  Running project packages hook..."
         . /smoothiso-hooks/packages.sh
@@ -2013,6 +2021,7 @@ GRUB_CMDLINE_LINUX="console=ttyS0,115200n8 console=tty0"
 GRUBCFG
 
     # Rebuild initramfs.
+    ui_status "Configuring system" "Rebuilding initramfs with LVM/RAID support." 4 6
     echo "  Rebuilding initramfs..."
     chroot "$TARGET" update-initramfs -u 2>&1 || true
 
@@ -2071,6 +2080,7 @@ UNIT
 
     # Product-specific configuration.
     if [ -f /smoothiso-hooks/configure.sh ]; then
+        ui_status "Configuring system" "Applying product-specific configuration." 4 6
         echo "  Running project configure hook..."
         . /smoothiso-hooks/configure.sh
     fi
@@ -2089,12 +2099,14 @@ install_grub() {
 
     if [ -d /sys/firmware/efi ]; then
         if chroot "$TARGET" dpkg -l grub-efi-amd64 2>/dev/null | grep -q '^ii'; then
+            ui_status "Installing bootloader" "Installing GRUB for UEFI." 5 6
             echo "  Installing GRUB (UEFI)..."
             chroot "$TARGET" grub-install --target=x86_64-efi \
                 --efi-directory=/boot/efi \
                 --bootloader-id="${PRODUCT_ID}" \
                 --recheck --no-nvram 2>&1 && uefi_ok=1 || \
                 echo "  WARNING: UEFI GRUB install failed"
+            ui_status "Installing bootloader" "Installing GRUB (UEFI removable fallback)." 5 6
             echo "  Installing GRUB (UEFI removable)..."
             chroot "$TARGET" grub-install --target=x86_64-efi \
                 --efi-directory=/boot/efi \
@@ -2105,6 +2117,7 @@ install_grub() {
 
     if chroot "$TARGET" dpkg -l grub-pc-bin 2>/dev/null | grep -q '^ii'; then
         for disk in $SELECTED_DISKS; do
+            ui_status "Installing bootloader" "Installing GRUB (BIOS) to ${disk}." 5 6
             echo "  Installing GRUB (BIOS) to $disk..."
             chroot "$TARGET" grub-install --target=i386-pc "$disk" 2>&1 \
                 && bios_ok=1 || \
@@ -2115,6 +2128,7 @@ install_grub() {
     [ "$uefi_ok" = "0" ] && [ "$bios_ok" = "0" ] && \
         echo "  ERROR: No bootloader installed successfully!"
 
+    ui_status "Installing bootloader" "Generating GRUB configuration." 5 6
     chroot "$TARGET" update-grub 2>&1 || echo "  WARNING: update-grub failed"
     echo "  GRUB installed."
 }
