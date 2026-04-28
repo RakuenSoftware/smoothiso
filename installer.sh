@@ -889,8 +889,6 @@ EOF
 # would later return ENODEV ("No such device").
 ensure_filesystem_module() {
     local fs="$1"
-    local kver
-    kver=$(uname -r)
 
     if grep -qE "[[:space:]]${fs}\$" /proc/filesystems 2>/dev/null; then
         return 0
@@ -903,32 +901,35 @@ ensure_filesystem_module() {
         return 0
     fi
 
-    # modprobe in the d-i ramdisk does not always resolve dependencies
-    # for modules that were appended to the initrd by build-iso.sh, so
-    # try loading the most common deps + the module file directly.
+    # modprobe in the d-i ramdisk fails when modules.dep is missing or
+    # incomplete, so fall back to loading dependency .ko files directly.
+    # Search both /lib/modules and /usr/lib/modules — d-i is not
+    # usr-merged but the host build can be.
+    local deps
     case "$fs" in
-        ext4)
-            for dep in crc16 crc32c_generic mbcache; do
-                modprobe "$dep" 2>/dev/null || true
-            done
-            insmod "/usr/lib/modules/${kver}/kernel/fs/jbd2/jbd2.ko.xz" 2>/dev/null || true
-            insmod "/usr/lib/modules/${kver}/kernel/fs/ext4/ext4.ko.xz" 2>/dev/null || true
-            ;;
-        ext3|ext2)
-            insmod "/usr/lib/modules/${kver}/kernel/fs/jbd2/jbd2.ko.xz" 2>/dev/null || true
-            insmod "/usr/lib/modules/${kver}/kernel/fs/${fs}/${fs}.ko.xz" 2>/dev/null || true
-            ;;
-        *)
-            for ko in $(find /usr/lib/modules /lib/modules \
-                -name "${fs}.ko*" 2>/dev/null); do
-                insmod "$ko" 2>/dev/null || true
-            done
-            ;;
+        ext4) deps="crc16 crc32c_generic mbcache jbd2" ;;
+        ext3|ext2) deps="jbd2 mbcache" ;;
+        vfat) deps="fat nls_cp437 nls_ascii nls_utf8" ;;
+        *) deps="" ;;
     esac
+    for dep in $deps; do
+        for ko in $(find /lib/modules /usr/lib/modules -name "${dep}.ko*" 2>/dev/null); do
+            insmod "$ko" 2>/dev/null || true
+        done
+    done
+    for ko in $(find /lib/modules /usr/lib/modules -name "${fs}.ko*" 2>/dev/null); do
+        insmod "$ko" 2>/dev/null || true
+    done
 
     if grep -qE "[[:space:]]${fs}\$" /proc/filesystems 2>/dev/null; then
         return 0
     fi
+
+    echo "  ensure_filesystem_module: $fs still missing — /proc/filesystems:"
+    sed 's/^/    /' /proc/filesystems 2>/dev/null || true
+    echo "  ensure_filesystem_module: looked under:"
+    find /lib/modules /usr/lib/modules -maxdepth 4 -name "${fs}.ko*" \
+        2>/dev/null | sed 's/^/    /' || true
     return 1
 }
 
@@ -996,6 +997,25 @@ setup_env() {
 
     export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
+    local kver
+    kver=$(uname -r)
+    # The d-i ramdisk does not have a `modules.dep` file for the
+    # extracted kernel modules, so plain `modprobe` fails with
+    # "can't open 'modules.dep': No such file or directory" and
+    # cannot resolve dependencies. Generate it now from whatever
+    # modules build-iso.sh stamped into /lib/modules/${kver}.
+    # Modern Debian uses a usr-merged layout, but the d-i installer
+    # ramdisk does not, so we cover both paths.
+    local mod_dir=""
+    for candidate in "/lib/modules/${kver}" "/usr/lib/modules/${kver}"; do
+        [ -d "$candidate" ] && { mod_dir="$candidate"; break; }
+    done
+    if [ -n "$mod_dir" ]; then
+        echo "  Generating module dependencies at ${mod_dir}..."
+        depmod -a 2>&1 | sed 's/^/    /' || \
+            depmod -b / "$kver" 2>&1 | sed 's/^/    /' || true
+    fi
+
     echo "  Loading modules..."
     for mod in virtio_pci virtio_scsi virtio_blk sd_mod ahci nvme scsi_mod \
                dm_mod dm_linear dm_striped dm_snapshot; do
@@ -1004,28 +1024,21 @@ setup_env() {
     for mod in vfat fat nls_cp437 nls_ascii nls_utf8; do
         modprobe "$mod" 2>/dev/null || true
     done
+    for mod in ext4 jbd2 crc16 crc32c_generic mbcache; do
+        modprobe "$mod" 2>/dev/null || true
+    done
 
-    local kver
-    kver=$(uname -r)
-    local mbase="/usr/lib/modules/${kver}/kernel"
+    local mbase="${mod_dir:-/lib/modules/${kver}}/kernel"
 
     insmod "${mbase}/drivers/md/dm-mod.ko.xz" 2>/dev/null || true
 
-    if ! grep -q ext4 /proc/filesystems 2>/dev/null; then
-        modprobe ext4 2>/dev/null || true
-    fi
-    if ! grep -q ext4 /proc/filesystems 2>/dev/null; then
-        modprobe crc16 2>/dev/null || true
-        modprobe crc32c_generic 2>/dev/null || true
-        modprobe mbcache 2>/dev/null || true
-        insmod "${mbase}/fs/jbd2/jbd2.ko.xz" 2>/dev/null || true
-        insmod "${mbase}/fs/ext4/ext4.ko.xz" 2>/dev/null || true
-    fi
-    if ! grep -q ext4 /proc/filesystems 2>/dev/null; then
-        for ko in $(find /usr/lib/modules -name 'ext4.ko*' 2>/dev/null); do
-            for dep in $(find /usr/lib/modules -name 'jbd2.ko*' 2>/dev/null); do
-                insmod "$dep" 2>/dev/null || true
-            done
+    if ! grep -qE '[[:space:]]ext4$' /proc/filesystems 2>/dev/null; then
+        for ko in $(find /lib/modules /usr/lib/modules \
+            \( -name 'jbd2.ko*' -o -name 'mbcache.ko*' -o -name 'crc16.ko*' \
+               -o -name 'crc32c_generic.ko*' \) 2>/dev/null); do
+            insmod "$ko" 2>/dev/null || true
+        done
+        for ko in $(find /lib/modules /usr/lib/modules -name 'ext4.ko*' 2>/dev/null); do
             insmod "$ko" 2>/dev/null || true
         done
     fi
@@ -1045,6 +1058,9 @@ setup_env() {
 
     udevadm trigger 2>/dev/null || true
     udevadm settle --timeout=10 2>/dev/null || sleep 3
+
+    echo "  /proc/filesystems:"
+    sed 's/^/    /' /proc/filesystems 2>/dev/null || true
 }
 
 # ============================================================
