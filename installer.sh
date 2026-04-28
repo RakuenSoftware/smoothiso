@@ -78,6 +78,15 @@ die() {
     echo ""
     echo "FATAL: $1" >&2
     echo "Dropping to shell for debugging. Type 'reboot' to restart."
+    # Surface the failure in the SmoothGUI kiosk before the shell takes
+    # over, so the operator can see what happened without scraping serial.
+    if [ -n "${UI_STATE_DIR:-}" ]; then
+        mkdir -p "$UI_STATE_DIR" 2>/dev/null || true
+        local escaped
+        escaped=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r/\\r/g; s/	/\\t/g')
+        printf '{"title":"Install failed","message":"%s","detail":"Check the serial console for diagnostics."}\n' \
+            "$escaped" > "${UI_STATE_DIR}/status.json" 2>/dev/null || true
+    fi
     exec /bin/sh
 }
 
@@ -799,37 +808,67 @@ ui_wait() {
 # stricter and fails with ENODEV when the /dev/dm-N target is missing.
 ensure_lvm_nodes() {
     local vg="$1"
-    local lv
+    local mapper_name target mapper
+
+    echo "  ensure_lvm_nodes($vg): start"
 
     mkdir -p /dev/mapper "/dev/${vg}"
     if [ ! -e /dev/mapper/control ]; then
+        echo "  ensure_lvm_nodes: creating /dev/mapper/control"
         mknod /dev/mapper/control c 10 236 2>/dev/null || true
     fi
 
-    vgchange -ay "$vg" >/dev/null 2>&1 || true
-    vgscan --mknodes >/dev/null 2>&1 || true
-    vgmknodes "$vg" >/dev/null 2>&1 || true
+    echo "  ensure_lvm_nodes: vgchange -ay"
+    vgchange -ay "$vg" 2>&1 | sed 's/^/    /' || true
+    echo "  ensure_lvm_nodes: vgscan --mknodes"
+    vgscan --mknodes 2>&1 | sed 's/^/    /' || true
+    echo "  ensure_lvm_nodes: vgmknodes"
+    vgmknodes "$vg" 2>&1 | sed 's/^/    /' || true
     if command -v dmsetup >/dev/null 2>&1; then
-        dmsetup mknodes >/dev/null 2>&1 || true
+        echo "  ensure_lvm_nodes: dmsetup mknodes"
+        dmsetup mknodes 2>&1 | sed 's/^/    /' || true
+    else
+        echo "  ensure_lvm_nodes: dmsetup not present; skipping"
     fi
-    udevadm settle --timeout=5 >/dev/null 2>&1 || sleep 1
+    echo "  ensure_lvm_nodes: udevadm settle"
+    udevadm settle --timeout=5 2>&1 | sed 's/^/    /' || sleep 1
+
+    echo "  ensure_lvm_nodes: lvs snapshot"
+    lvs --noheadings --nosuffix \
+        -o lv_name,lv_kernel_major,lv_kernel_minor "$vg" 2>&1 | sed 's/^/    /' || true
 
     # Fallback: synthesize the device files directly from lvs's
     # kernel major:minor when the symlink layers are still broken.
-    lvs --noheadings --nosuffix \
-        -o lv_name,lv_kernel_major,lv_kernel_minor "$vg" 2>/dev/null \
-        | while read -r lv maj min _rest; do
-            [ -n "$lv" ] && [ -n "$maj" ] && [ -n "$min" ] || continue
-            local target="/dev/${vg}/${lv}"
-            local mapper="/dev/mapper/${vg//-/--}-${lv//-/--}"
-            if [ -e "$target" ] && [ -b "$target" ]; then
-                continue
-            fi
-            rm -f "$target" 2>/dev/null || true
-            rm -f "$mapper" 2>/dev/null || true
-            mknod "$mapper" b "$maj" "$min" 2>/dev/null || true
-            ln -sf "$mapper" "$target" 2>/dev/null || true
-        done
+    # Use a here-string into a plain while-read so we stay in the
+    # outer shell (the subshell `lvs ... | while` swallows variable
+    # writes, which is mostly cosmetic but matters for diagnostics).
+    local lv_dump
+    lv_dump=$(lvs --noheadings --nosuffix \
+        -o lv_name,lv_kernel_major,lv_kernel_minor "$vg" 2>/dev/null || true)
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        # shellcheck disable=SC2086
+        set -- $line
+        local lv="${1:-}" maj="${2:-}" min="${3:-}"
+        [ -n "$lv" ] && [ -n "$maj" ] && [ -n "$min" ] || continue
+        target="/dev/${vg}/${lv}"
+        mapper_name=$(printf '%s' "${vg}" | sed 's/-/--/g')-$(printf '%s' "${lv}" | sed 's/-/--/g')
+        mapper="/dev/mapper/${mapper_name}"
+        if [ -b "$target" ]; then
+            echo "  ensure_lvm_nodes: ${target} already a block device"
+            continue
+        fi
+        echo "  ensure_lvm_nodes: synthesizing ${mapper} -> b ${maj}:${min}"
+        rm -f "$target" 2>/dev/null || true
+        rm -f "$mapper" 2>/dev/null || true
+        mknod "$mapper" b "$maj" "$min" 2>/dev/null || true
+        ln -sf "$mapper" "$target" 2>/dev/null || true
+    done <<EOF
+$lv_dump
+EOF
+
+    echo "  ensure_lvm_nodes: final ls /dev/${vg}"
+    ls -la "/dev/${vg}" 2>&1 | sed 's/^/    /' || true
 
     [ -e "/dev/${vg}" ] || return 1
     return 0
