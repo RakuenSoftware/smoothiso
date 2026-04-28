@@ -23,6 +23,9 @@
 #   SMOOTHGUI_FRONTEND_REQUIRED  Set to 1 to require SmoothGUI at runtime (default: 1)
 #   SMOOTHGUI_FRONTEND_PORT      Frontend bind port (default: 8080)
 #   SMOOTHGUI_FRONTEND_BIND      Frontend bind address (default: 0.0.0.0)
+#   INSTALLER_KERNEL_PACKAGES   Kernel packages installed by install_packages.
+#       Default "linux-image-amd64 linux-headers-amd64". Set to "" if the
+#       project ships its own kernel and installs it from packages.sh.
 #
 # Hook interface (all optional — absence is not an error):
 #   $HOOKS_DIR/embed.sh

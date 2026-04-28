@@ -1541,9 +1541,19 @@ HOOK
         grub-efi-amd64 grub-pc-bin efibootmgr \
         2>&1 || die "Failed to install GRUB packages"
 
-    echo "  Installing kernel and core packages..."
+    # Kernel packages. Projects that ship their own kernel set
+    # INSTALLER_KERNEL_PACKAGES="" and install it from packages.sh.
+    local kernel_pkgs="${INSTALLER_KERNEL_PACKAGES-linux-image-amd64 linux-headers-amd64}"
+    if [ -n "$kernel_pkgs" ]; then
+        echo "  Installing kernel packages: ${kernel_pkgs}..."
+        # shellcheck disable=SC2086
+        DEBIAN_FRONTEND=noninteractive chroot "$TARGET" apt-get install -y -qq \
+            $kernel_pkgs \
+            2>/dev/null || true
+    fi
+
+    echo "  Installing core packages..."
     DEBIAN_FRONTEND=noninteractive chroot "$TARGET" apt-get install -y -qq \
-        linux-image-amd64 linux-headers-amd64 \
         lvm2 mdadm \
         openssh-server \
         sudo curl wget ca-certificates \
