@@ -898,8 +898,20 @@ setup_network() {
 
     echo "  Found $iface_count interface(s): $ifaces"
     echo "  Bringing interfaces up..."
-    for iface in $ifaces; do ip link set "$iface" up & done
-    wait; sleep 1
+    # Plain `wait` would block on every child of the installer, including
+    # the long-running Firefox/Xorg/dbus/httpd processes spawned from
+    # ui_init_frontend — and hang forever. Capture PIDs and wait only for
+    # the link-up commands.
+    local link_pids=""
+    for iface in $ifaces; do
+        ip link set "$iface" up &
+        link_pids="$link_pids $!"
+    done
+    if [ -n "$link_pids" ]; then
+        # shellcheck disable=SC2086
+        wait $link_pids 2>/dev/null || true
+    fi
+    sleep 1
 
     echo "  Network discovery complete."
     echo "  Trying DHCP on all interfaces..."
