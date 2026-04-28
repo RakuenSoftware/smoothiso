@@ -207,8 +207,22 @@ install_installer_browser() {
         return 0
     fi
 
+    # base-files ships only the usr-merge transitional symlinks (./lib ->
+    # usr/lib, ./bin -> usr/bin, etc.) and a handful of /etc placeholders.
+    # We do not want any of that in the d-i initramfs: the installer needs
+    # /lib to remain a real directory so the kernel-module udebs land
+    # alongside d-i's existing /lib/modules tree, and the cpio merge step
+    # removes-then-replaces directories that disagree with the staging
+    # tree (which would also wipe d-i's /lib/modules content). Any other
+    # package emitting a ./lib -> usr/lib symlink would have the same
+    # effect; tar refuses to write the symlink over an existing real dir
+    # and the build aborts. Skip such packages — they exist solely to
+    # mark a usr-merged installation.
     shopt -s nullglob
     while IFS= read -r package_file; do
+        case "$(basename "$package_file")" in
+            base-files_*) continue ;;
+        esac
         dpkg-deb -x "$package_file" "$initrd_tmp"
     done < "$selected_file"
     shopt -u nullglob
