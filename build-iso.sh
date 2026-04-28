@@ -553,8 +553,14 @@ setup_initrd() {
     chmod +x "${tmp}/smoothiso-firstboot"
 
     # Embed preseed that hands off to the generic installer.
+    # Mirror installer output to /dev/ttyS0 so that operators can debug a
+    # frozen install via the serial console — /dev/console resolves to
+    # /dev/tty0 (last `console=` on the kernel cmdline) which is hidden under
+    # Xorg/Firefox once the SmoothGUI kiosk launches, leaving the visible
+    # screen useless for diagnostics. Tee handles the case where ttyS0
+    # doesn't exist (no serial port) by failing silently to /dev/null.
     cat > "${tmp}/preseed.cfg" << 'PRESEED'
-d-i preseed/early_command string exec /smoothiso-installer < /dev/console > /dev/console 2>&1
+d-i preseed/early_command string sh -c 'exec /smoothiso-installer < /dev/console 2>&1 | tee /dev/ttyS0 > /dev/console'
 PRESEED
 
     # Write the product config file read by the installer at runtime.
