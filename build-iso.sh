@@ -392,11 +392,27 @@ setup_initrd() {
         udeb=$(find "${POOL_DIR}" -name "$pattern" | head -1)
         if [ -n "$udeb" ]; then
             echo "  Extracting modules from $(basename "$udeb")..."
-            # Extract straight into the initrd at /lib/modules — this is
-            # the canonical location modprobe searches by default. The
-            # earlier indirection through /usr/lib/modules left modprobe
-            # unable to find the appended modules at install time.
-            dpkg-deb -x "$udeb" "$tmp"
+            local udeb_tmp
+            udeb_tmp=$(mktemp -d)
+            dpkg-deb -x "$udeb" "$udeb_tmp"
+
+            local kver
+            kver=$(find "$udeb_tmp/lib/modules" -maxdepth 1 -mindepth 1 -type d \
+                -printf '%f\n' 2>/dev/null | head -1)
+            if [ -n "$kver" ]; then
+                # Stage at /lib/modules (modprobe's only search path).
+                # The browser packages already laid down a usr-merged
+                # `lib -> usr/lib` symlink earlier, so we cannot extract
+                # the udeb directly with dpkg-deb (tar refuses to write
+                # through the directory symlink). cp follows the symlink,
+                # so files land at the resolved /usr/lib/modules path
+                # while the /lib/modules symlink keeps modprobe happy.
+                mkdir -p "${tmp}/lib/modules/${kver}"
+                cp -a --no-clobber -r "$udeb_tmp/lib/modules/${kver}/." \
+                    "${tmp}/lib/modules/${kver}/" 2>/dev/null || true
+            fi
+
+            rm -rf "$udeb_tmp"
         fi
     done
 
