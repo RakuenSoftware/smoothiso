@@ -674,6 +674,14 @@ repack_iso() {
     (cd "$WORK_DIR" && find . -type f ! -name md5sum.txt ! -path './isolinux/*' \
         -exec md5sum {} \; 2>/dev/null) > "${WORK_DIR}/md5sum.txt"
 
+    # ISO 9660 caps the volume label at 32 chars; xorriso aborts with
+    # `-volid: Text too long` rather than silently truncating. Build the
+    # label here and trim if necessary so any version string is accepted.
+    local volid="${ISO_LABEL} ${VERSION}"
+    if [ "${#volid}" -gt 32 ]; then
+        volid="${volid:0:32}"
+    fi
+
     xorriso -as mkisofs \
         -o "$ISO_OUTPUT_FILE" \
         -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
@@ -686,7 +694,7 @@ repack_iso() {
         -e boot/grub/efi.img \
         -no-emul-boot \
         -isohybrid-gpt-basdat \
-        -V "${ISO_LABEL} ${VERSION}" \
+        -V "$volid" \
         "$WORK_DIR"
 
     echo ""
