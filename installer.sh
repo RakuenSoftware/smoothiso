@@ -746,6 +746,35 @@ ui_notify() {
     ui_write_request "notice" "$title" "$message" "{}" >/dev/null
 }
 
+# ui_status TITLE [MESSAGE [CURRENT TOTAL [DETAIL]]]
+# Writes a non-blocking status payload that the SmoothGUI client polls via
+# /cgi-bin/status. Use this between blocking ui_prompt_* calls to surface
+# progress during long automated steps (debootstrap, package install,
+# configure, GRUB).
+ui_status() {
+    local title="${1:-}"
+    local message="${2:-}"
+    local current="${3:-}"
+    local total="${4:-}"
+    local detail="${5:-}"
+    local fields=""
+
+    [ -n "$title" ] && fields="${fields}\"title\":\"$(ui_escape_json "$title")\","
+    [ -n "$message" ] && fields="${fields}\"message\":\"$(ui_escape_json "$message")\","
+    if [ -n "$current" ] && [ -n "$total" ]; then
+        fields="${fields}\"current\":${current},\"total\":${total},"
+    fi
+    [ -n "$detail" ] && fields="${fields}\"detail\":\"$(ui_escape_json "$detail")\","
+
+    fields="${fields%,}"
+    mkdir -p "$UI_STATE_DIR" 2>/dev/null || true
+    printf '{%s}\n' "$fields" > "${UI_STATE_DIR}/status.json"
+}
+
+ui_clear_status() {
+    rm -f "${UI_STATE_DIR}/status.json" 2>/dev/null || true
+}
+
 ui_wait() {
     [ "$UI_FRONTEND_ENABLED" = "1" ] || return 1
 
@@ -1955,9 +1984,22 @@ setup_network
 sync_clock
 select_disks
 prompt_password
+
+ui_status "Partitioning disks" "Wiping and partitioning the selected disks." 1 6
 do_partitioning
+
+ui_status "Installing base system" "Running debootstrap to install Debian ${DEBIAN_SUITE}. This takes a few minutes." 2 6
 install_base
+
+ui_status "Installing packages" "Installing kernel, bootloader, and product packages." 3 6
 install_packages
+
+ui_status "Configuring system" "Writing fstab, network, GRUB defaults, and product services." 4 6
 configure_system
+
+ui_status "Installing bootloader" "Installing GRUB to the selected disk(s)." 5 6
 install_grub
+
+ui_status "Finalizing" "Finishing up." 6 6
+ui_clear_status
 finish

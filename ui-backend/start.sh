@@ -25,9 +25,12 @@ log() {
 }
 cp "${SCRIPT_DIR}/request" "$CGI_DIR/request" 2>/dev/null || true
 cp "${SCRIPT_DIR}/respond" "$CGI_DIR/respond" 2>/dev/null || true
+cp "${SCRIPT_DIR}/status" "$CGI_DIR/status" 2>/dev/null || true
 ln -sf "${CGI_DIR}/request" "/cgi-bin/request" 2>/dev/null || true
 ln -sf "${CGI_DIR}/respond" "/cgi-bin/respond" 2>/dev/null || true
-chmod +x "$CGI_DIR/request" "$CGI_DIR/respond" "/cgi-bin/request" "/cgi-bin/respond" 2>/dev/null || true
+ln -sf "${CGI_DIR}/status" "/cgi-bin/status" 2>/dev/null || true
+chmod +x "$CGI_DIR/request" "$CGI_DIR/respond" "$CGI_DIR/status" \
+    "/cgi-bin/request" "/cgi-bin/respond" "/cgi-bin/status" 2>/dev/null || true
 
 start_python() {
     if ! command -v python3 >/dev/null 2>&1; then
@@ -43,6 +46,7 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 request_dir = os.environ.get("UI_REQUEST_DIR", "/run/smoothiso-ui/requests")
 response_dir = os.environ.get("UI_RESPONSE_DIR", "/run/smoothiso-ui/responses")
+state_dir = os.environ.get("UI_STATE_DIR", "/run/smoothiso-ui")
 bind_addr = os.environ.get("SMOOTHGUI_FRONTEND_BIND", "0.0.0.0")
 bind_port = int(os.environ.get("SMOOTHGUI_FRONTEND_PORT", "8080"))
 frontend_dir = os.environ.get("UI_FRONTEND_DIR", "/smoothiso-ui")
@@ -93,6 +97,14 @@ class InstallerBridgeHandler(SimpleHTTPRequestHandler):
             return None
         return ids[0]
 
+    def _current_status(self):
+        path = os.path.join(state_dir, "status.json")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/cgi-bin/request":
@@ -101,6 +113,9 @@ class InstallerBridgeHandler(SimpleHTTPRequestHandler):
                 self._json(None)
                 return
             self._json(request)
+            return
+        if parsed.path == "/cgi-bin/status":
+            self._json(self._current_status())
             return
         super().do_GET()
 
@@ -299,6 +314,14 @@ case "$path" in
         [ "$method" = "GET" ] || { http_respond "405" "Method Not Allowed" "application/json; charset=utf-8" '{"error":"method not allowed"}'; exit 0; }
         payload=$(next_request_json)
         http_respond "200" "OK" "application/json; charset=utf-8" "$payload"
+        ;;
+    /cgi-bin/status)
+        [ "$method" = "GET" ] || { http_respond "405" "Method Not Allowed" "application/json; charset=utf-8" '{"error":"method not allowed"}'; exit 0; }
+        if [ -f "${STATE_DIR}/status.json" ]; then
+            http_respond "200" "OK" "application/json; charset=utf-8" "$(cat "${STATE_DIR}/status.json")"
+        else
+            http_respond "200" "OK" "application/json; charset=utf-8" "null"
+        fi
         ;;
     /cgi-bin/respond)
         [ "$method" = "POST" ] || { http_respond "405" "Method Not Allowed" "application/json; charset=utf-8" '{"error":"method not allowed"}'; exit 0; }

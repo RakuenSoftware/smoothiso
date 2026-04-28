@@ -604,7 +604,9 @@ CONF
     # Shared backend bridge scripts.
     cp -a "${SMOOTHISO_DIR}/ui-backend/." "${tmp}/smoothiso-ui-backend/"
     chmod +x "${tmp}/smoothiso-ui-backend/start.sh"
-    chmod +x "${tmp}/smoothiso-ui-backend/request" "${tmp}/smoothiso-ui-backend/respond"
+    chmod +x "${tmp}/smoothiso-ui-backend/request" \
+             "${tmp}/smoothiso-ui-backend/respond" \
+             "${tmp}/smoothiso-ui-backend/status"
 
     # Call the project embed hook (e.g. to embed product binaries).
     if [ -f "${HOOKS_DIR}/embed.sh" ]; then
