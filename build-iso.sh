@@ -386,6 +386,17 @@ setup_initrd() {
     local tmp
     tmp=$(mktemp -d)
 
+    # Mirror the d-i initramfs layout: trixie's d-i is usr-merged,
+    # so /lib, /bin, /sbin are symlinks to usr/{lib,bin,sbin}. Create
+    # the same symlinks in our staging tree before anything else
+    # writes to /lib — otherwise mkdir / cp would create /lib as a
+    # real directory and the cpio merge step would later try to copy
+    # that directory onto the d-i symlink and abort.
+    mkdir -p "${tmp}/usr/lib" "${tmp}/usr/bin" "${tmp}/usr/sbin"
+    ln -sf usr/lib "${tmp}/lib"
+    ln -sf usr/bin "${tmp}/bin"
+    ln -sf usr/sbin "${tmp}/sbin"
+
     # Extract hardware modules from udebs.
     local udeb_patterns=(
         "scsi-core-modules-*-${ARCH}-di_*.udeb"
