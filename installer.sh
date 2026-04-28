@@ -1300,12 +1300,46 @@ sync_clock() {
 # 3. Disk selection
 # ============================================================
 
+# Resolve a stable identifier for a block device, suitable for matching
+# back to a hypervisor / hardware inventory entry from the kiosk. /dev/sdX
+# letters are non-deterministic across boots (depends on virtio-scsi
+# probe order), so the kiosk has to surface something durable.
+#
+# Preference order:
+#   wwn-*    — NAA WWN, present on most physical and many virtio-scsi disks
+#   nvme-*   — NVMe model + serial
+#   scsi-*   — SCSI vendor/product/serial (QEMU virtio-scsi exposes the
+#              PVE slot as `drive-scsi0`, so this directly identifies the
+#              VM-config slot the operator picks)
+#   ata-*    — ATA model + serial
+#   virtio-* — virtio-blk fallback
+disk_stable_id() {
+    local name="$1"
+    local prefix link target
+
+    [ -d /dev/disk/by-id ] || return 0
+    for prefix in wwn nvme scsi ata virtio; do
+        for link in /dev/disk/by-id/${prefix}-*; do
+            [ -L "$link" ] || continue
+            target=$(readlink -f "$link" 2>/dev/null || true)
+            if [ "$target" = "/dev/${name}" ]; then
+                basename "$link"
+                return 0
+            fi
+        done
+    done
+    return 0
+}
+
 select_disks() {
     msg "Disk selection"
 
-    DISK_LIST=""
-    DISK_COUNT=0
-    local unsorted=""
+    # Build a tab-separated table (size, /dev/name, label, description)
+    # so we can sort by size before rendering JSON. Tab is safe — none of
+    # the fields ever contain it.
+    local entries
+    entries=$(mktemp 2>/dev/null || echo /tmp/.smoothiso-disks.$$)
+    : > "$entries"
 
     for dev in /sys/block/*; do
         local name=$(basename "$dev")
@@ -1328,56 +1362,58 @@ select_disks() {
         [ "$mounted" = "1" ] && continue
 
         local model=$(cat "$dev/device/model" 2>/dev/null \
-            | sed 's/[[:space:]]*$//' | tr ' ' '_' || echo "Disk")
+            | sed 's/[[:space:]]*$//; s/^[[:space:]]*//' || echo "")
         [ -z "$model" ] && model="Disk"
 
-        unsorted="$unsorted
-$sz /dev/$name ${gb}GB_${model} off"
+        local stable_id
+        stable_id=$(disk_stable_id "$name")
+
+        # Headline visible to the operator: size + vendor/model + the
+        # current /dev/sdX letter (only valid for this boot, but useful
+        # for cross-referencing serial output during the install).
+        local label="${gb} GB · ${model} (/dev/${name})"
+        # Subtitle: the durable identifier they should match against
+        # PVE / their hardware inventory. For virtio-scsi this looks
+        # like `scsi-0QEMU_QEMU_HARDDISK_drive-scsi0`, so the
+        # `drive-scsi0` suffix is the PVE slot name.
+        local desc="$stable_id"
+        [ -z "$desc" ] && desc="(no stable identifier — /dev/${name} only valid for this boot)"
+
+        printf '%s\t/dev/%s\t%s\t%s\n' "$sz" "$name" "$label" "$desc" >> "$entries"
     done
 
-    local sorted=$(echo "$unsorted" | sort -n)
-    local IFS_OLD="$IFS"; IFS='
-'
-    for line in $sorted; do
-        [ -z "$line" ] && continue
-        local entry=$(echo "$line" | sed 's/^[0-9]* //')
-        DISK_LIST="$DISK_LIST $entry"
-        DISK_COUNT=$((DISK_COUNT + 1))
-    done
-    IFS="$IFS_OLD"
+    if [ ! -s "$entries" ]; then
+        rm -f "$entries"
+        die "No available disks found"
+    fi
 
-    [ "$DISK_COUNT" -eq 0 ] && die "No available disks found"
+    sort -n -k1,1 "$entries" -o "$entries"
 
-    local disk_devs="" disk_descs="" disk_sel=""
-    local _field=0
-    for token in $DISK_LIST; do
-        case "$_field" in
-            0) disk_devs="$disk_devs $token"; _field=1 ;;
-            1) disk_descs="$disk_descs $token"; _field=2 ;;
-            2) disk_sel="$disk_sel 0"; _field=0 ;;
-        esac
-    done
-
-    local index=1
     local ui_disk_options="["
-    for dev in $disk_devs; do
-        local desc=$(echo "$disk_descs" | awk "{print \$$index}")
-        ui_disk_options="${ui_disk_options}{\"value\":\"$dev\",\"label\":\"$(ui_escape_json "$desc")\"},"
-        index=$((index + 1))
-    done
+    while IFS="	" read -r _sz dev label desc; do
+        [ -n "$dev" ] || continue
+        ui_disk_options="${ui_disk_options}{\"value\":\"${dev}\",\"label\":\"$(ui_escape_json "$label")\",\"description\":\"$(ui_escape_json "$desc")\"},"
+    done < "$entries"
+    rm -f "$entries"
     ui_disk_options="${ui_disk_options%,}]"
 
     ui_require_frontend
     local ui_selected
     ui_selected=$(ui_prompt_checklist \
         "${PRODUCT_NAME} - Select OS Disk(s)" \
-        'Select one or more disks for the OS.\n\nOne disk: standard LVM.\nTwo or more: RAID-1 mirror + LVM.' \
+        'Select one or more disks for the OS.\n\nOne disk: standard LVM.\nTwo or more: RAID-1 mirror + LVM.\n\nThe identifier under each disk is its stable hardware/hypervisor name.' \
         "$ui_disk_options") || ui_selected=""
     [ -n "$ui_selected" ] && SELECTED_DISKS="$ui_selected"
     [ -z "$SELECTED_DISKS" ] && die "No disks selected"
 
     SELECTED_COUNT=$(echo "$SELECTED_DISKS" | wc -w)
     echo "  Selected $SELECTED_COUNT disk(s): $SELECTED_DISKS"
+    for d in $SELECTED_DISKS; do
+        local _name=$(basename "$d")
+        local _id
+        _id=$(disk_stable_id "$_name")
+        [ -n "$_id" ] && echo "    ${d}  ->  ${_id}"
+    done
 
     if [ "$SELECTED_COUNT" -gt 1 ]; then
         USE_RAID=1
