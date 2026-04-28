@@ -460,6 +460,11 @@ setup_initrd() {
     local dm_udeb; dm_udeb=$(find "${POOL_DIR}" -name 'libdevmapper*-udeb_*.udeb' | head -1)
     [ -n "$dm_udeb" ] && extract_bins "$dm_udeb"
 
+    # dmsetup is required so partition_single can rebuild /dev/mapper/* and
+    # /dev/${VG}/${LV} when the d-i initrd ships without LVM udev rules.
+    local dmsetup_udeb; dmsetup_udeb=$(find "${POOL_DIR}" -name 'dmsetup-udeb_*.udeb' | head -1)
+    [ -n "$dmsetup_udeb" ] && extract_bins "$dmsetup_udeb" dmsetup
+
     local mdadm_udeb; mdadm_udeb=$(find "${POOL_DIR}" -name 'mdadm-udeb_*.udeb' | head -1)
     [ -n "$mdadm_udeb" ] && extract_bins "$mdadm_udeb" mdadm
 

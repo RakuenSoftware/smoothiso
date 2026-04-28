@@ -791,6 +791,50 @@ ui_wait() {
     return 0
 }
 
+# Ensure the volume group's logical volumes have working /dev/${VG}/${LV}
+# device entries. The d-i installer ships without the LVM udev rules that
+# normally create /dev/dm-N + /dev/mapper/* + /dev/${VG}/${LV} when LVs are
+# activated, so we have to (re)build the chain by hand. mkfs may have
+# succeeded earlier through one of the symlink layers, but mount is
+# stricter and fails with ENODEV when the /dev/dm-N target is missing.
+ensure_lvm_nodes() {
+    local vg="$1"
+    local lv
+
+    mkdir -p /dev/mapper "/dev/${vg}"
+    if [ ! -e /dev/mapper/control ]; then
+        mknod /dev/mapper/control c 10 236 2>/dev/null || true
+    fi
+
+    vgchange -ay "$vg" >/dev/null 2>&1 || true
+    vgscan --mknodes >/dev/null 2>&1 || true
+    vgmknodes "$vg" >/dev/null 2>&1 || true
+    if command -v dmsetup >/dev/null 2>&1; then
+        dmsetup mknodes >/dev/null 2>&1 || true
+    fi
+    udevadm settle --timeout=5 >/dev/null 2>&1 || sleep 1
+
+    # Fallback: synthesize the device files directly from lvs's
+    # kernel major:minor when the symlink layers are still broken.
+    lvs --noheadings --nosuffix \
+        -o lv_name,lv_kernel_major,lv_kernel_minor "$vg" 2>/dev/null \
+        | while read -r lv maj min _rest; do
+            [ -n "$lv" ] && [ -n "$maj" ] && [ -n "$min" ] || continue
+            local target="/dev/${vg}/${lv}"
+            local mapper="/dev/mapper/${vg//-/--}-${lv//-/--}"
+            if [ -e "$target" ] && [ -b "$target" ]; then
+                continue
+            fi
+            rm -f "$target" 2>/dev/null || true
+            rm -f "$mapper" 2>/dev/null || true
+            mknod "$mapper" b "$maj" "$min" 2>/dev/null || true
+            ln -sf "$mapper" "$target" 2>/dev/null || true
+        done
+
+    [ -e "/dev/${vg}" ] || return 1
+    return 0
+}
+
 # Ensure device mapper is loaded and LVM device nodes exist.
 activate_lvm() {
     if ! grep -q device-mapper /proc/devices 2>/dev/null; then
@@ -1360,12 +1404,16 @@ partition_single() {
     lvcreate -Wy -y -L 4G -n swap "${VG_NAME}"
     lvcreate -Wy -y -l 100%FREE -n root "${VG_NAME}"
 
-    vgscan --mknodes 2>/dev/null || true
-    vgchange -ay "${VG_NAME}" 2>/dev/null || true
-    udevadm settle --timeout=5 2>/dev/null || sleep 2
+    ensure_lvm_nodes "${VG_NAME}" || \
+        die "Could not bring up /dev/${VG_NAME} after lvcreate"
 
     mkswap "/dev/${VG_NAME}/swap"
     mkfs.ext4 -F "/dev/${VG_NAME}/root"
+
+    # mkfs syncs and closes the dm device; rebuild the node chain again so
+    # the next consumer (mount) sees a fully populated /dev/${VG_NAME}/.
+    ensure_lvm_nodes "${VG_NAME}" || \
+        die "/dev/${VG_NAME}/root vanished after mkfs"
 
     mount -t ext4 "/dev/${VG_NAME}/root" "$TARGET" || \
         die "Failed to mount /dev/${VG_NAME}/root on $TARGET"
@@ -1426,9 +1474,8 @@ EOF
     lvcreate -Wy -y -L 4G -n swap "${VG_NAME}"
     lvcreate -Wy -y -l 100%FREE -n root "${VG_NAME}"
 
-    vgscan --mknodes 2>/dev/null || true
-    vgchange -ay "${VG_NAME}" 2>/dev/null || true
-    udevadm settle --timeout=5 2>/dev/null || sleep 2
+    ensure_lvm_nodes "${VG_NAME}" || \
+        die "Could not bring up /dev/${VG_NAME} after lvcreate"
 
     mkswap "/dev/${VG_NAME}/swap"
     mkfs.ext4 -F "/dev/${VG_NAME}/root"
@@ -1441,6 +1488,9 @@ EOF
         efi_part="${first_disk}2"
     fi
     mkfs.vfat -F 32 "$efi_part"
+
+    ensure_lvm_nodes "${VG_NAME}" || \
+        die "/dev/${VG_NAME}/root vanished after mkfs"
 
     mount -t ext4 "/dev/${VG_NAME}/root" "$TARGET" || \
         die "Failed to mount /dev/${VG_NAME}/root on $TARGET"
