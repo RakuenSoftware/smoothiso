@@ -68,15 +68,21 @@ class InstallerBridgeHandler(SimpleHTTPRequestHandler):
         except FileNotFoundError:
             return None
         for name in files:
-            if name.endswith(".json"):
-                path = os.path.join(request_dir, name)
-                if not os.path.isfile(path):
-                    continue
-                with open(path, "r", encoding="utf-8") as fh:
-                    try:
-                        return json.load(fh)
-                    except json.JSONDecodeError:
-                        return {"id": "invalid", "kind": "notice", "title": "Invalid request", "message": "Installer request payload is malformed."}
+            if not name.endswith(".json"):
+                continue
+            # Skip requests that already have a response so the React
+            # client stops polling the form between submit and the
+            # installer-side cleanup.
+            if os.path.exists(os.path.join(response_dir, name)):
+                continue
+            path = os.path.join(request_dir, name)
+            if not os.path.isfile(path):
+                continue
+            with open(path, "r", encoding="utf-8") as fh:
+                try:
+                    return json.load(fh)
+                except json.JSONDecodeError:
+                    return {"id": "invalid", "kind": "notice", "title": "Invalid request", "message": "Installer request payload is malformed."}
         return None
 
     def _consume_query_id(self):
@@ -203,6 +209,10 @@ http_respond() {
 next_request_json() {
     for req_file in "$REQUEST_DIR"/*.json; do
         [ -f "$req_file" ] || continue
+        # Skip requests already answered — keeps the React poll from
+        # re-rendering the form between submit and installer cleanup.
+        name=$(basename "$req_file" .json)
+        [ -f "${RESPONSE_DIR}/${name}.json" ] && continue
         cat "$req_file"
         return 0
     done

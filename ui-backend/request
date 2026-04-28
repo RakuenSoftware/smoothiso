@@ -2,6 +2,7 @@
 set -eu
 
 REQUEST_DIR="${UI_REQUEST_DIR:-/run/smoothiso-ui/requests}"
+RESPONSE_DIR="${UI_RESPONSE_DIR:-/run/smoothiso-ui/responses}"
 
 send_json() {
     printf 'Content-Type: application/json\r\n'
@@ -15,8 +16,17 @@ if [ ! -d "$REQUEST_DIR" ]; then
     exit 0
 fi
 
+# Pick the first request that does NOT yet have a matching response file.
+# Once the browser POSTs to /cgi-bin/respond the response file appears and
+# we stop serving the same request — otherwise the React poll loop keeps
+# re-rendering the form between submit and installer.sh cleanup, creating
+# an endless-prompt experience.
 REQ_FILE=""
 for path in $(ls -1 "$REQUEST_DIR"/*.json 2>/dev/null); do
+    name=$(basename "$path" .json)
+    if [ -f "${RESPONSE_DIR}/${name}.json" ]; then
+        continue
+    fi
     REQ_FILE="$path"
     break
 done
