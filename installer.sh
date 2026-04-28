@@ -873,9 +873,63 @@ EOF
 
     echo "  ensure_lvm_nodes: final ls /dev/${vg}"
     ls -la "/dev/${vg}" 2>&1 | sed 's/^/    /' || true
+    echo "  ensure_lvm_nodes: /dev/mapper listing"
+    ls -la /dev/mapper 2>&1 | sed 's/^/    /' || true
+    echo "  ensure_lvm_nodes: dm-* nodes"
+    ls -la /dev/dm-* 2>&1 | sed 's/^/    /' || true
 
     [ -e "/dev/${vg}" ] || return 1
     return 0
+}
+
+# Make sure the named filesystem driver is registered with the kernel,
+# loading it via modprobe / insmod fallbacks if it is not. Required
+# before mount() — mkfs is a userspace operation that does not need a
+# kernel filesystem driver, so it can succeed on a system where mount()
+# would later return ENODEV ("No such device").
+ensure_filesystem_module() {
+    local fs="$1"
+    local kver
+    kver=$(uname -r)
+
+    if grep -qE "[[:space:]]${fs}\$" /proc/filesystems 2>/dev/null; then
+        return 0
+    fi
+
+    echo "  ensure_filesystem_module: loading $fs"
+    modprobe "$fs" 2>&1 | sed 's/^/    /' || true
+
+    if grep -qE "[[:space:]]${fs}\$" /proc/filesystems 2>/dev/null; then
+        return 0
+    fi
+
+    # modprobe in the d-i ramdisk does not always resolve dependencies
+    # for modules that were appended to the initrd by build-iso.sh, so
+    # try loading the most common deps + the module file directly.
+    case "$fs" in
+        ext4)
+            for dep in crc16 crc32c_generic mbcache; do
+                modprobe "$dep" 2>/dev/null || true
+            done
+            insmod "/usr/lib/modules/${kver}/kernel/fs/jbd2/jbd2.ko.xz" 2>/dev/null || true
+            insmod "/usr/lib/modules/${kver}/kernel/fs/ext4/ext4.ko.xz" 2>/dev/null || true
+            ;;
+        ext3|ext2)
+            insmod "/usr/lib/modules/${kver}/kernel/fs/jbd2/jbd2.ko.xz" 2>/dev/null || true
+            insmod "/usr/lib/modules/${kver}/kernel/fs/${fs}/${fs}.ko.xz" 2>/dev/null || true
+            ;;
+        *)
+            for ko in $(find /usr/lib/modules /lib/modules \
+                -name "${fs}.ko*" 2>/dev/null); do
+                insmod "$ko" 2>/dev/null || true
+            done
+            ;;
+    esac
+
+    if grep -qE "[[:space:]]${fs}\$" /proc/filesystems 2>/dev/null; then
+        return 0
+    fi
+    return 1
 }
 
 # Ensure device mapper is loaded and LVM device nodes exist.
@@ -1458,6 +1512,15 @@ partition_single() {
     ensure_lvm_nodes "${VG_NAME}" || \
         die "/dev/${VG_NAME}/root vanished after mkfs"
 
+    # mount() needs the filesystem driver registered with the kernel.
+    # mkfs is userspace and writes ext4 metadata directly, so it can
+    # succeed on a system where mount would still ENODEV. Force-load
+    # ext4 + vfat before any mount.
+    ensure_filesystem_module ext4 || \
+        die "ext4 kernel module not registered; cannot mount root"
+    ensure_filesystem_module vfat || \
+        echo "  WARNING: vfat module not registered; EFI mount may fail"
+
     mount -t ext4 "/dev/${VG_NAME}/root" "$TARGET" || \
         die "Failed to mount /dev/${VG_NAME}/root on $TARGET"
     mkdir -p "$TARGET/boot"
@@ -1534,6 +1597,11 @@ EOF
 
     ensure_lvm_nodes "${VG_NAME}" || \
         die "/dev/${VG_NAME}/root vanished after mkfs"
+
+    ensure_filesystem_module ext4 || \
+        die "ext4 kernel module not registered; cannot mount root"
+    ensure_filesystem_module vfat || \
+        echo "  WARNING: vfat module not registered; EFI mount may fail"
 
     mount -t ext4 "/dev/${VG_NAME}/root" "$TARGET" || \
         die "Failed to mount /dev/${VG_NAME}/root on $TARGET"
