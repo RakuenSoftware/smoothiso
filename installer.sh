@@ -1686,12 +1686,29 @@ HOOK
         mount --bind /dev/pts "$TARGET/dev/pts" 2>/dev/null || true
         mount -t proc proc "$TARGET/proc" 2>/dev/null || true
         mount -t sysfs sysfs "$TARGET/sys" 2>/dev/null || true
+        # Stub pam-auth-update inside the chroot before reconfiguring.
+        # libpam-runtime's postinst calls pam-auth-update, which uses
+        # debconf's Perl frontend and hangs in the d-i ramdisk despite
+        # DEBIAN_FRONTEND=noninteractive. The dpkg --configure call
+        # itself is also wrapped in `timeout` so any other postinst
+        # that locks up does not stall the entire install.
+        if [ -f "$TARGET/usr/sbin/pam-auth-update" ] && \
+            [ ! -f "$TARGET/usr/sbin/pam-auth-update.real" ]; then
+            mv "$TARGET/usr/sbin/pam-auth-update" \
+               "$TARGET/usr/sbin/pam-auth-update.real"
+            printf '#!/bin/sh\nexit 0\n' > "$TARGET/usr/sbin/pam-auth-update"
+            chmod +x "$TARGET/usr/sbin/pam-auth-update"
+        fi
         for pkg in $stubbed_pkgs; do
             echo "    Configuring $pkg..."
-            DEBIAN_FRONTEND=noninteractive chroot "$TARGET" \
-                dpkg --configure "$pkg" 2>&1 || \
-                echo "    WARNING: $pkg configure returned non-zero"
+            timeout 60 env DEBIAN_FRONTEND=noninteractive \
+                chroot "$TARGET" dpkg --configure "$pkg" 2>&1 \
+                || echo "    WARNING: $pkg configure returned non-zero"
         done
+        if [ -f "$TARGET/usr/sbin/pam-auth-update.real" ]; then
+            mv "$TARGET/usr/sbin/pam-auth-update.real" \
+               "$TARGET/usr/sbin/pam-auth-update"
+        fi
         umount "$TARGET/sys" "$TARGET/proc" "$TARGET/dev/pts" "$TARGET/dev" \
             2>/dev/null || true
     fi
