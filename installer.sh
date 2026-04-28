@@ -556,9 +556,11 @@ ui_launch_frontend_viewer() {
     fi
 
     if [ "$launched" -ne 1 ]; then
+        # `--app=URL` was the SSB / Single-Site-Browser flag; Firefox 78
+        # removed support without printing an error, so the browser silently
+        # falls back to its default homepage. Modern builds (Firefox ESR 12x)
+        # need `--kiosk URL` instead.
         for candidate in \
-            "firefox-esr --app=%s --no-remote" \
-            "firefox --app=%s --no-remote" \
             "firefox-esr --kiosk --no-remote %s" \
             "firefox --kiosk --no-remote %s"; do
             if ui_launch_frontend_viewer_command "$candidate" "$frontend_url"; then

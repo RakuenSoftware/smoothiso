@@ -219,6 +219,33 @@ install_installer_browser() {
     else
         echo "  WARNING: installer browser package ${browser_pkg} not available after embedding; installer GUI may not launch."
     fi
+
+    # Firefox enterprise policy: suppress first-run / telemetry / data
+    # collection prompts so the kiosk loads straight to the installer URL
+    # without a modal overlay. Firefox-ESR reads /etc/firefox/policies/.
+    local policies_dir="${initrd_tmp}/etc/firefox/policies"
+    mkdir -p "$policies_dir"
+    cat > "${policies_dir}/policies.json" << 'POLICIES'
+{
+  "policies": {
+    "DisableAppUpdate": true,
+    "DisableFirefoxStudies": true,
+    "DisableTelemetry": true,
+    "DisableFeedbackCommands": true,
+    "DisableProfileImport": true,
+    "DisableFirefoxAccounts": true,
+    "DisablePocket": true,
+    "DontCheckDefaultBrowser": true,
+    "OverrideFirstRunPage": "",
+    "OverridePostUpdatePage": "",
+    "PasswordManagerEnabled": false,
+    "PromptForDownloadLocation": false,
+    "NetworkPrediction": false,
+    "OfferToSaveLogins": false,
+    "DNSOverHTTPS": { "Enabled": false }
+  }
+}
+POLICIES
 }
 
 install_full_busybox() {
