@@ -35,6 +35,38 @@ DEBIAN_SUITE="${DEBIAN_SUITE:-trixie}"
 DEBIAN_MIRROR="${DEBIAN_MIRROR:-http://deb.debian.org/debian}"
 DATA_DIR="${DATA_DIR:-/var/lib/${PRODUCT_ID}}"
 TLS_DIR="${TLS_DIR:-/etc/${PRODUCT_ID}/tls}"
+UI_STATE_DIR="${UI_STATE_DIR:-/run/smoothiso-ui}"
+UI_REQUEST_DIR="${UI_REQUEST_DIR:-${UI_STATE_DIR}/requests}"
+UI_RESPONSE_DIR="${UI_RESPONSE_DIR:-${UI_STATE_DIR}/responses}"
+UI_FRONTEND_DIR="${SMOOTHGUI_FRONTEND_DIR:-/smoothiso-ui}"
+SMOOTHGUI_FRONTEND_BIND="${SMOOTHGUI_FRONTEND_BIND:-127.0.0.1}"
+SMOOTHGUI_FRONTEND_PORT="${SMOOTHGUI_FRONTEND_PORT:-8080}"
+UI_FRONTEND_BACKEND="${UI_FRONTEND_BACKEND:-/smoothiso-ui-backend/start.sh}"
+# Blocking interactive prompts (disk-select, password, completion). The
+# operator needs time to read the screen and pick options, so we give a
+# generous 30-minute window before declaring the kiosk dead. Status
+# polling uses UI_REQUEST_TIMEOUT separately.
+UI_FRONTEND_TIMEOUT="${UI_FRONTEND_TIMEOUT:-1800}"
+UI_FRONTEND_ENABLED=0
+UI_FRONTEND_REQUIRED="${SMOOTHGUI_FRONTEND_REQUIRED:-1}"
+UI_FRONTEND_SERVER_PID=""
+UI_FRONTEND_VIEWER_PID=""
+UI_FRONTEND_XVFB_PID=""
+UI_FRONTEND_XORG_PID=""
+UI_FRONTEND_DBUS_PID=""
+UI_FRONTEND_VIEWER_LAUNCHED=0
+SMOOTHGUI_FIREFOX_HOME="/run/smoothiso-ui/firefox-home"
+SMOOTHGUI_FIREFOX_RUNTIME="/run/smoothiso-ui/firefox-runtime"
+SMOOTHGUI_DISPLAY="${SMOOTHGUI_DISPLAY:-:0}"
+SMOOTHGUI_XORG_STARTUP_TIMEOUT="${SMOOTHGUI_XORG_STARTUP_TIMEOUT:-12}"
+SMOOTHGUI_REQUIRE_VISIBLE_DISPLAY="${SMOOTHGUI_REQUIRE_VISIBLE_DISPLAY:-1}"
+SMOOTHGUI_BROWSER_USER="${SMOOTHGUI_BROWSER_USER:-smoothinstaller}"
+SMOOTHGUI_BROWSER_UID="${SMOOTHGUI_BROWSER_UID:-1000}"
+SMOOTHGUI_BROWSER_GID="${SMOOTHGUI_BROWSER_GID:-1000}"
+SMOOTHGUI_FRONTEND_READY_TIMEOUT="${SMOOTHGUI_FRONTEND_READY_TIMEOUT:-25}"
+
+# Optional timeout for front-end UI requests (seconds).
+UI_REQUEST_TIMEOUT="${UI_REQUEST_TIMEOUT:-60}"
 
 # ============================================================
 # Utility
@@ -50,6 +82,15 @@ die() {
     echo ""
     echo "FATAL: $1" >&2
     echo "Dropping to shell for debugging. Type 'reboot' to restart."
+    # Surface the failure in the SmoothGUI kiosk before the shell takes
+    # over, so the operator can see what happened without scraping serial.
+    if [ -n "${UI_STATE_DIR:-}" ]; then
+        mkdir -p "$UI_STATE_DIR" 2>/dev/null || true
+        local escaped
+        escaped=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r/\\r/g; s/	/\\t/g')
+        printf '{"title":"Install failed","message":"%s","detail":"Check the serial console for diagnostics."}\n' \
+            "$escaped" > "${UI_STATE_DIR}/status.json" 2>/dev/null || true
+    fi
     exec /bin/sh
 }
 
@@ -59,6 +100,837 @@ run_whiptail() {
     whiptail "$@" 2>"$_wt_tmp" </dev/console >/dev/console || true
     cat "$_wt_tmp" 2>/dev/null
     rm -f "$_wt_tmp"
+}
+
+# Escape a value for a simple JSON payload.
+ui_escape_json() {
+    printf '%s' "$1" \
+        | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r/\\r/g; s/\n/\\n/g; s/\t/\\t/g'
+}
+
+ui_init_frontend() {
+    mkdir -p /run || die "Unable to create /run for SmoothGUI state."
+
+    # Bring up the loopback interface before the bridge tries to bind 127.0.0.1.
+    # d-i's early_command runs before any networking step, so lo is created but
+    # still DOWN — bind() then fails with EADDRNOTAVAIL and every backend looks
+    # broken. Doing this here is cheap and idempotent.
+    if command -v ip >/dev/null 2>&1; then
+        ip link set lo up 2>/dev/null || true
+        ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
+    elif command -v ifconfig >/dev/null 2>&1; then
+        ifconfig lo 127.0.0.1 up 2>/dev/null || true
+    fi
+
+    if [ -d "$UI_FRONTEND_DIR" ] || [ "$SMOOTHGUI_ENABLE_FRONTEND" = "1" ] \
+        || [ -n "${SMOOTHGUI_FRONTEND_DIR:-}" ]; then
+        UI_FRONTEND_ENABLED=1
+        mkdir -p "$UI_REQUEST_DIR" "$UI_RESPONSE_DIR" 2>/dev/null || true
+    fi
+
+    if [ "$UI_FRONTEND_ENABLED" = "1" ] && [ "$UI_FRONTEND_REQUIRED" = "1" ]; then
+        if [ ! -d "$UI_FRONTEND_DIR" ] && [ -z "${SMOOTHGUI_FRONTEND_DIR:-}" ]; then
+            die "SmoothGUI frontend required but no UI assets were discovered"
+        fi
+        if [ ! -f "${UI_FRONTEND_DIR}/index.html" ] && [ ! -f "${UI_FRONTEND_DIR}/index.installer.html" ]; then
+            die "SmoothGUI frontend required but no index file was found in $UI_FRONTEND_DIR"
+        fi
+        if [ ! -d "$UI_REQUEST_DIR" ] || [ ! -d "$UI_RESPONSE_DIR" ]; then
+            die "SmoothGUI frontend required but request directories are unavailable"
+        fi
+    fi
+
+    if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+        if [ ! -x "$UI_FRONTEND_BACKEND" ]; then
+            if [ "$UI_FRONTEND_REQUIRED" = "1" ]; then
+                die "SmoothGUI frontend bridge missing or not executable: $UI_FRONTEND_BACKEND"
+            fi
+            UI_FRONTEND_ENABLED=0
+        else
+            ui_start_frontend_server || {
+                if [ "$UI_FRONTEND_REQUIRED" = "1" ]; then
+                    die "SmoothGUI frontend bridge failed to start"
+                fi
+                UI_FRONTEND_ENABLED=0
+            }
+            ui_launch_frontend_viewer
+        fi
+    fi
+}
+
+ui_backend_log() {
+    echo "${UI_STATE_DIR}/smoothiso-frontend.log"
+}
+
+ui_dump_frontend_log() {
+    local log_file="$1"
+    [ -s "$log_file" ] || return 0
+    echo "SmoothGUI frontend log:"
+    tail -n 40 "$log_file" >&2
+}
+
+ui_frontend_url() {
+    if [ -f "${UI_FRONTEND_DIR}/index.installer.html" ]; then
+        printf "http://127.0.0.1:%s/index.installer.html" "$SMOOTHGUI_FRONTEND_PORT"
+        return
+    fi
+    printf "http://127.0.0.1:%s/index.html" "$SMOOTHGUI_FRONTEND_PORT"
+}
+
+ui_wait_frontend_http() {
+    local url="$1"
+    local timeout="$2"
+    local wait_count=0
+
+    [ -n "$url" ] || return 1
+    if ! command -v wget >/dev/null 2>&1; then
+        return 0
+    fi
+
+    while [ "$wait_count" -lt "$timeout" ]; do
+        if wget -q -T 1 -O /tmp/smoothiso-frontcheck.html "$url" >/dev/null 2>&1; then
+            rm -f /tmp/smoothiso-frontcheck.html
+            return 0
+        fi
+        sleep 1
+        wait_count=$((wait_count + 1))
+    done
+    return 1
+}
+
+ui_launch_frontend_viewer_command() {
+    local template="$1"
+    local url="$2"
+    local rendered
+    local binary
+    local launcher_cmd
+    local run_cmd
+    local browser_user
+    local firefox_env
+    local escaped_rendered
+
+    rendered=$(printf "$template" "$url")
+    binary=$(printf '%s' "$rendered" | awk '{
+        for (i = 1; i <= NF; i++) {
+            if ($i !~ /=/) {
+                print $i
+                exit
+            }
+        }
+    }')
+    [ -n "$binary" ] || return 1
+    command -v "$binary" >/dev/null 2>&1 || return 1
+    [ -x "$(command -v "$binary")" ] || return 1
+
+    launcher_cmd="$rendered"
+    if [ "$binary" = "firefox" ] || [ "$binary" = "firefox-esr" ]; then
+        [ -n "${DISPLAY:-}" ] || return 1
+        browser_user="${SMOOTHGUI_BROWSER_USER:-}"
+        ui_ensure_browser_user || return 1
+        mkdir -p "$SMOOTHGUI_FIREFOX_HOME" "$SMOOTHGUI_FIREFOX_RUNTIME"
+        firefox_env="DISPLAY=$DISPLAY HOME=$SMOOTHGUI_FIREFOX_HOME XDG_RUNTIME_DIR=$SMOOTHGUI_FIREFOX_RUNTIME"
+        firefox_env="$firefox_env MOZ_DISABLE_SAFE_MODE_KEY=1 MOZ_DBUS_SESSION_BUS_ADDRESS=\"$DBUS_SESSION_BUS_ADDRESS\""
+        firefox_env="$firefox_env MOZ_X11_EGL=0 MOZ_WEBRENDER=0 MOZ_USE_XINPUT2=0 LIBGL_ALWAYS_SOFTWARE=1 MOZ_DISABLE_WAYLAND=1"
+        # Note: NO `exec` here. `env A=B exec firefox-esr ...` makes env try to
+        # execve("exec", ...) — exec is a shell builtin, not a binary. Drop it
+        # and let `sh -c` exec the resulting command directly.
+        launcher_cmd="env $firefox_env $rendered"
+        escaped_rendered=$(printf '%s' "$launcher_cmd" | sed "s/'/'\\\\''/g")
+        if [ -n "$browser_user" ] && command -v runuser >/dev/null 2>&1; then
+            launcher_cmd="runuser -u ${browser_user} -- sh -c '$escaped_rendered'"
+        elif [ -n "$browser_user" ] && command -v su >/dev/null 2>&1; then
+            launcher_cmd="su -s /bin/sh ${browser_user} -c '$escaped_rendered'"
+        fi
+    fi
+
+    run_cmd=$launcher_cmd
+    sh -c "$run_cmd" </dev/console >"/tmp/smoothiso-browser.log" 2>&1 &
+    UI_FRONTEND_VIEWER_PID=$!
+    if [ -z "$UI_FRONTEND_VIEWER_PID" ]; then
+        return 1
+    fi
+    sleep 1
+    if ! kill -0 "$UI_FRONTEND_VIEWER_PID" 2>/dev/null; then
+        sed -n '1,40p' /tmp/smoothiso-browser.log >&2 || true
+        UI_FRONTEND_VIEWER_PID=""
+        return 1
+    fi
+    sleep 2
+    if [ "$binary" = "firefox" ] || [ "$binary" = "firefox-esr" ]; then
+        if ! kill -0 "$UI_FRONTEND_VIEWER_PID" 2>/dev/null; then
+            sed -n '1,80p' /tmp/smoothiso-browser.log >&2 || true
+            UI_FRONTEND_VIEWER_PID=""
+            return 1
+        fi
+    fi
+    return 0
+}
+
+ui_start_frontend_server() {
+    [ "$UI_FRONTEND_ENABLED" = "1" ] || return 1
+    [ -x "$UI_FRONTEND_BACKEND" ] || return 1
+
+    mkdir -p "${UI_STATE_DIR}"
+    local backend_log
+    backend_log="$(ui_backend_log)"
+    rm -f "$backend_log"
+    export UI_STATE_DIR UI_REQUEST_DIR UI_RESPONSE_DIR UI_FRONTEND_DIR \
+        SMOOTHGUI_FRONTEND_BIND SMOOTHGUI_FRONTEND_PORT
+    "$UI_FRONTEND_BACKEND" >"$backend_log" 2>&1 &
+    UI_FRONTEND_SERVER_PID="$!"
+
+    local wait_count=0
+    while ! kill -0 "$UI_FRONTEND_SERVER_PID" 2>/dev/null; do
+        wait_count=$((wait_count + 1))
+        if [ "$wait_count" -ge 5 ]; then
+            ui_dump_frontend_log "$backend_log"
+            return 1
+        fi
+        sleep 1
+    done
+    return 0
+}
+
+ui_stop_frontend() {
+    if [ -n "$UI_FRONTEND_SERVER_PID" ]; then
+        kill "$UI_FRONTEND_SERVER_PID" 2>/dev/null || true
+        UI_FRONTEND_SERVER_PID=""
+    fi
+    if [ -n "$UI_FRONTEND_VIEWER_PID" ]; then
+        kill "$UI_FRONTEND_VIEWER_PID" 2>/dev/null || true
+        UI_FRONTEND_VIEWER_PID=""
+    fi
+    if [ -n "$UI_FRONTEND_XVFB_PID" ]; then
+        kill "$UI_FRONTEND_XVFB_PID" 2>/dev/null || true
+        UI_FRONTEND_XVFB_PID=""
+    fi
+    if [ -n "$UI_FRONTEND_XORG_PID" ]; then
+        kill "$UI_FRONTEND_XORG_PID" 2>/dev/null || true
+        UI_FRONTEND_XORG_PID=""
+    fi
+    if [ -n "$UI_FRONTEND_DBUS_PID" ]; then
+        kill "$UI_FRONTEND_DBUS_PID" 2>/dev/null || true
+        UI_FRONTEND_DBUS_PID=""
+    fi
+}
+
+ui_ensure_display() {
+    if [ -n "${DISPLAY:-}" ]; then
+        if command -v xdpyinfo >/dev/null 2>&1; then
+            if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        unset DISPLAY
+    fi
+
+    if [ -d /etc/X11 ]; then
+        printf 'allowed_users=anybody\nneeds_root_rights=no\n' > /etc/X11/Xwrapper.config 2>/dev/null || true
+    else
+        mkdir -p /etc/X11 2>/dev/null || true
+        printf 'allowed_users=anybody\nneeds_root_rights=no\n' > /etc/X11/Xwrapper.config 2>/dev/null || true
+    fi
+    mkdir -p /tmp/.X11-unix 2>/dev/null || true
+    chmod 1777 /tmp/.X11-unix 2>/dev/null || true
+
+    if command -v Xorg >/dev/null 2>&1; then
+        mkdir -p /tmp/smoothiso-ui
+        local xorg_attempt
+        local xorg_driver
+        local wait_count
+        local xorg_base_args
+        local xorg_driver_conf
+
+        # Xorg rejects Xvfb-style geometry args (`-screen 0 WxH -depth N` etc.) —
+        # passing them makes Xorg print its help text and exit. Resolution is
+        # configured via the per-driver xorg.conf snippet below instead.
+        xorg_base_args="-noreset -ac -nolisten tcp -br -novtswitch"
+
+        for xorg_attempt in vt7 vt1 ""; do
+            for xorg_driver in auto vesa modesetting fbdev; do
+                if [ "$xorg_driver" = "auto" ]; then
+                    xorg_driver_conf=""
+                else
+                    xorg_driver_conf="/tmp/smoothiso-xorg-${xorg_driver}.conf"
+                    cat > "$xorg_driver_conf" <<EOF
+Section "Device"
+    Identifier "SmoothGUI"
+    Driver "${xorg_driver}"
+EndSection
+
+Section "Monitor"
+    Identifier "SmoothGUI-Monitor"
+    HorizSync 28.0-80.0
+    VertRefresh 48.0-75.0
+EndSection
+
+Section "Screen"
+    Identifier "SmoothGUI-Screen"
+    Device "SmoothGUI"
+    Monitor "SmoothGUI-Monitor"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+        Modes "1280x720" "1024x768" "800x600"
+    EndSubSection
+EndSection
+EOF
+                fi
+
+                if [ -n "$xorg_attempt" ]; then
+                    Xorg "$SMOOTHGUI_DISPLAY" "$xorg_attempt" $xorg_base_args ${xorg_driver_conf:+-config "$xorg_driver_conf"} >/tmp/smoothiso-xorg.log 2>&1 &
+                else
+                    Xorg "$SMOOTHGUI_DISPLAY" $xorg_base_args ${xorg_driver_conf:+-config "$xorg_driver_conf"} >/tmp/smoothiso-xorg.log 2>&1 &
+                fi
+                UI_FRONTEND_XORG_PID=$!
+
+                wait_count=0
+                while [ "$wait_count" -lt "$SMOOTHGUI_XORG_STARTUP_TIMEOUT" ]; do
+                    sleep 1
+                    wait_count=$((wait_count + 1))
+                    if ! kill -0 "$UI_FRONTEND_XORG_PID" 2>/dev/null; then
+                        break
+                    fi
+                    if command -v xdpyinfo >/dev/null 2>&1; then
+                        if xdpyinfo -display "$SMOOTHGUI_DISPLAY" >/dev/null 2>&1; then
+                            export DISPLAY="$SMOOTHGUI_DISPLAY"
+                            if command -v xhost >/dev/null 2>&1 && [ -n "${SMOOTHGUI_BROWSER_USER:-}" ]; then
+                                xhost +SI:localuser:"$SMOOTHGUI_BROWSER_USER" >/tmp/smoothiso-xhost.log 2>&1 || true
+                            fi
+                            return 0
+                        fi
+                    else
+                        export DISPLAY="$SMOOTHGUI_DISPLAY"
+                        if command -v xhost >/dev/null 2>&1 && [ -n "${SMOOTHGUI_BROWSER_USER:-}" ]; then
+                            xhost +SI:localuser:"$SMOOTHGUI_BROWSER_USER" >/tmp/smoothiso-xhost.log 2>&1 || true
+                        fi
+                        return 0
+                    fi
+                done
+
+                kill "$UI_FRONTEND_XORG_PID" 2>/dev/null || true
+                wait "$UI_FRONTEND_XORG_PID" 2>/dev/null || true
+                UI_FRONTEND_XORG_PID=""
+                sed -n '1,120p' /tmp/smoothiso-xorg.log >&2 || true
+            done
+        done
+        [ "$SMOOTHGUI_REQUIRE_VISIBLE_DISPLAY" = "1" ] && return 1
+    fi
+
+    if [ "${SMOOTHGUI_ALLOW_XVFB:-0}" != "1" ]; then
+        return 1
+    fi
+
+    if ! command -v Xvfb >/dev/null 2>&1; then
+        return 1
+    fi
+    mkdir -p /tmp/smoothiso-ui
+    Xvfb "$SMOOTHGUI_DISPLAY" -screen 0 1280x720 -depth 24 >/tmp/smoothiso-xvfb.log 2>&1 &
+    UI_FRONTEND_XVFB_PID=$!
+    sleep 1
+    if ! kill -0 "$UI_FRONTEND_XVFB_PID" 2>/dev/null; then
+        UI_FRONTEND_XVFB_PID=""
+        return 1
+    fi
+
+    export DISPLAY="$SMOOTHGUI_DISPLAY"
+    if command -v xdpyinfo >/dev/null 2>&1; then
+        if ! xdpyinfo -display "$SMOOTHGUI_DISPLAY" >/dev/null 2>&1; then
+            kill "$UI_FRONTEND_XVFB_PID" 2>/dev/null || true
+            UI_FRONTEND_XVFB_PID=""
+            return 1
+        fi
+    fi
+    if command -v xhost >/dev/null 2>&1 && [ -n "${SMOOTHGUI_BROWSER_USER:-}" ]; then
+        xhost +SI:localuser:"$SMOOTHGUI_BROWSER_USER" >/tmp/smoothiso-xhost.log 2>&1 || true
+    fi
+    return 0
+}
+
+ui_ensure_browser_user() {
+    local user="${SMOOTHGUI_BROWSER_USER:-}"
+    local uid="${SMOOTHGUI_BROWSER_UID:-1000}"
+    local gid="${SMOOTHGUI_BROWSER_GID:-1000}"
+
+    [ -z "$user" ] && return 0
+    [ -d "$SMOOTHGUI_FIREFOX_HOME" ] || mkdir -p "$SMOOTHGUI_FIREFOX_HOME"
+    [ -d "$SMOOTHGUI_FIREFOX_RUNTIME" ] || mkdir -p "$SMOOTHGUI_FIREFOX_RUNTIME"
+
+    if id "$user" >/dev/null 2>&1; then
+        chown -R "${uid}:${gid}" "$SMOOTHGUI_FIREFOX_HOME" "$SMOOTHGUI_FIREFOX_RUNTIME" 2>/dev/null || true
+        return 0
+    fi
+
+    if command -v useradd >/dev/null 2>&1; then
+        useradd -M -N -u "$uid" -g "$gid" -s /bin/sh -d "$SMOOTHGUI_FIREFOX_HOME" "$user" 2>/dev/null || \
+            useradd -M -u "$uid" -g "$gid" -s /bin/sh "$user" 2>/dev/null || \
+            useradd -M "$user" 2>/dev/null || return 1
+        chown -R "${uid}:${gid}" "$SMOOTHGUI_FIREFOX_HOME" "$SMOOTHGUI_FIREFOX_RUNTIME" 2>/dev/null || true
+        return 0
+    fi
+
+    grep -q "^${gid}:" /etc/group 2>/dev/null || printf "%s:x:%s:\n" "$user" "$gid" >> /etc/group
+    grep -q "^${user}:x:${uid}:" /etc/passwd 2>/dev/null || \
+        printf "%s:x:%s:%s:SmoothISO Browser User:%s:/bin/sh\n" "$user" "$uid" "$gid" "$SMOOTHGUI_FIREFOX_HOME" >> /etc/passwd
+    chown -R "${uid}:${gid}" "$SMOOTHGUI_FIREFOX_HOME" "$SMOOTHGUI_FIREFOX_RUNTIME" 2>/dev/null || true
+}
+
+ui_ensure_dbus() {
+    if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        return 0
+    fi
+
+    if ! command -v dbus-daemon >/dev/null 2>&1; then
+        return 1
+    fi
+
+    local dbus_info
+    local dbus_addr
+    local dbus_pid
+
+    dbus_info="$(dbus-daemon --session --fork --print-address --print-pid 2>/tmp/smoothiso-dbus.err || true)"
+    dbus_addr="$(printf '%s\n' "$dbus_info" | sed -n '1p')"
+    dbus_pid="$(printf '%s\n' "$dbus_info" | sed -n '2p')"
+    [ -n "$dbus_addr" ] || return 1
+
+    DBUS_SESSION_BUS_ADDRESS="$dbus_addr"
+    export DBUS_SESSION_BUS_ADDRESS
+    UI_FRONTEND_DBUS_PID="$dbus_pid"
+    return 0
+}
+
+ui_require_frontend() {
+    [ "$UI_FRONTEND_ENABLED" = "1" ] || die "SmoothGUI frontend required but was not initialized."
+}
+
+ui_handle_timeout() {
+    local label="$1"
+    if [ "$UI_FRONTEND_REQUIRED" = "1" ]; then
+        die "Timed out waiting for SmoothGUI installer response while ${label}."
+    fi
+    return 1
+}
+
+ui_ensure_frontend_alive() {
+    [ "$UI_FRONTEND_ENABLED" = "1" ] || return 1
+    [ -n "$UI_FRONTEND_SERVER_PID" ] || return 1
+    kill -0 "$UI_FRONTEND_SERVER_PID" 2>/dev/null || return 1
+    return 0
+}
+
+ui_launch_frontend_viewer() {
+    [ "$UI_FRONTEND_ENABLED" = "1" ] || return 0
+    if [ "$UI_FRONTEND_VIEWER_LAUNCHED" = "1" ]; then
+        return 0
+    fi
+
+    if ! ui_ensure_display; then
+        ui_dump_frontend_log "$(ui_backend_log)"
+        if [ "$UI_FRONTEND_REQUIRED" = "1" ]; then
+            die "SmoothGUI frontend failed to initialize display."
+        fi
+        return 0
+    fi
+    if ! ui_ensure_dbus; then
+        ui_dump_frontend_log "$(ui_backend_log)"
+        if [ "$UI_FRONTEND_REQUIRED" = "1" ]; then
+            die "SmoothGUI frontend failed to start D-Bus session."
+        fi
+        return 0
+    fi
+
+    if ! ui_ensure_frontend_alive; then
+        ui_start_frontend_server || true
+    fi
+    if ! ui_ensure_frontend_alive; then
+        ui_dump_frontend_log "$(ui_backend_log)"
+        die "SmoothGUI frontend backend unavailable while starting installer UI."
+    fi
+
+    local frontend_url
+    local launched
+    local custom_viewer_cmd
+    launched=0
+    frontend_url="$(ui_frontend_url)"
+    custom_viewer_cmd="${SMOOTHGUI_VIEWER_COMMAND:-}"
+
+    if ! ui_wait_frontend_http "$frontend_url" "$SMOOTHGUI_FRONTEND_READY_TIMEOUT"; then
+        if [ "$UI_FRONTEND_REQUIRED" = "1" ]; then
+            ui_dump_frontend_log "$(ui_backend_log)"
+            die "SmoothGUI frontend failed to start HTTP service on ${frontend_url}."
+        fi
+        return 0
+    fi
+
+    if [ -n "$custom_viewer_cmd" ]; then
+        if ui_launch_frontend_viewer_command "$custom_viewer_cmd" "$frontend_url"; then
+            launched=1
+        fi
+    fi
+
+    if [ "$launched" -ne 1 ]; then
+        # `--app=URL` was the SSB / Single-Site-Browser flag; Firefox 78
+        # removed support without printing an error, so the browser silently
+        # falls back to its default homepage. Modern builds (Firefox ESR 12x)
+        # need `--kiosk URL` instead.
+        for candidate in \
+            "firefox-esr --kiosk --no-remote %s" \
+            "firefox --kiosk --no-remote %s"; do
+            if ui_launch_frontend_viewer_command "$candidate" "$frontend_url"; then
+                launched=1
+                break
+            fi
+        done
+    fi
+
+    if [ "$launched" -ne 1 ] || [ -z "$UI_FRONTEND_VIEWER_PID" ]; then
+        if [ "$UI_FRONTEND_REQUIRED" = "1" ]; then
+            ui_dump_frontend_log "$(ui_backend_log)"
+            die "SmoothGUI frontend viewer unavailable in installer environment."
+        fi
+        return 0
+    fi
+
+    echo "SmoothGUI browser launched for installer UI." >/dev/console
+    UI_FRONTEND_VIEWER_LAUNCHED=1
+}
+
+ui_request_id() {
+    date +%s.%N 2>/dev/null | tr -cd '0-9' | head -c 32
+}
+
+ui_read_json_string_from_stdin() {
+    local key="$1"
+    sed -n "s/.*\\\"${key}\\\"[[:space:]]*:[[:space:]]*\\\"\\([^\"]*\\)\\\".*/\\1/p" | head -n 1
+}
+
+ui_read_json_array_from_stdin() {
+    local key="$1"
+    local raw
+    raw=$(sed -n "s/.*\\\"${key}\\\"[[:space:]]*:[[:space:]]*\\[\\(.*\\)\\].*/\\1/p" | head -n 1)
+    raw=$(printf '%s' "$raw" | tr -d '[]"' | tr ',' ' ')
+    printf '%s' "$raw"
+}
+
+ui_cleanup_frontend_entry() {
+    local req_id="$1"
+    [ -z "$req_id" ] && return
+    rm -f "${UI_REQUEST_DIR}/${req_id}.json" \
+          "${UI_RESPONSE_DIR}/${req_id}.json" 2>/dev/null || true
+}
+
+ui_write_request() {
+    local kind="$1"
+    local title="$2"
+    local message="$3"
+    local payload="$4"
+    local req_id
+
+    req_id="$(ui_request_id)"
+    mkdir -p "$UI_REQUEST_DIR" "$UI_RESPONSE_DIR" 2>/dev/null || true
+    cat > "${UI_REQUEST_DIR}/${req_id}.json" <<EOF
+{
+  "id": "${req_id}",
+  "kind": "${kind}",
+  "title": "$(ui_escape_json "$title")",
+  "message": "$(ui_escape_json "$message")",
+  "payload": ${payload}
+}
+EOF
+    echo "$req_id"
+}
+
+ui_wait_response() {
+    local req_id="$1"
+    local max_wait="${2:-$UI_REQUEST_TIMEOUT}"
+    local label="${3:-installer response}"
+    local start now elapsed
+    start=$(date +%s)
+
+    while :; do
+        if ! ui_ensure_frontend_alive; then
+            ui_dump_frontend_log "$(ui_backend_log)"
+            if [ "$UI_FRONTEND_REQUIRED" = "1" ]; then
+                die "SmoothGUI frontend backend stopped while ${label}."
+            fi
+            return 1
+        fi
+
+        if [ -f "${UI_RESPONSE_DIR}/${req_id}.json" ]; then
+            cat "${UI_RESPONSE_DIR}/${req_id}.json"
+            return 0
+        fi
+
+        now=$(date +%s)
+        elapsed=$((now - start))
+        [ "$elapsed" -ge "$max_wait" ] && return 1
+        sleep 1
+    done
+}
+
+ui_read_json_string() {
+    local key="$1"
+    local file="$2"
+    cat "$file" | ui_read_json_string_from_stdin "$key"
+}
+
+ui_read_json_array() {
+    local key="$1"
+    local file="$2"
+    cat "$file" | ui_read_json_array_from_stdin "$key"
+}
+
+ui_prompt_text() {
+    [ "$UI_FRONTEND_ENABLED" = "1" ] || return 1
+
+    local title="$1"
+    local message="$2"
+    local default_value="$3"
+    local req_id
+    local answer_file
+    local response
+    local value
+
+    ui_launch_frontend_viewer
+    req_id=$(ui_write_request "text" "$title" "$message" \
+        "{\"default\": \"$(ui_escape_json "$default_value")\"}")
+    response=$(ui_wait_response "$req_id" "$UI_FRONTEND_TIMEOUT" "$title") \
+        || ui_handle_timeout "collecting text input"
+    value=$(printf '%s' "$response" | ui_read_json_string_from_stdin "value" | tr -d '\r')
+    if [ -z "$value" ]; then
+        value=$(printf '%s' "$response" | ui_read_json_string_from_stdin "answer" | tr -d '\r')
+    fi
+
+    ui_cleanup_frontend_entry "$req_id"
+    printf '%s' "$value"
+}
+
+ui_prompt_password() {
+    [ "$UI_FRONTEND_ENABLED" = "1" ] || return 1
+
+    local title="$1"
+    local message="$2"
+    local req_id
+    local response
+    local value
+
+    ui_launch_frontend_viewer
+    req_id=$(ui_write_request "password" "$title" "$message" "{}")
+    response=$(ui_wait_response "$req_id" "$UI_FRONTEND_TIMEOUT" "$title") \
+        || ui_handle_timeout "collecting password"
+    value=$(printf '%s' "$response" | ui_read_json_string_from_stdin "value" | tr -d '\r')
+    if [ -z "$value" ]; then
+        value=$(printf '%s' "$response" | ui_read_json_string_from_stdin "answer" | tr -d '\r')
+    fi
+
+    ui_cleanup_frontend_entry "$req_id"
+    printf '%s' "$value"
+}
+
+ui_prompt_checklist() {
+    [ "$UI_FRONTEND_ENABLED" = "1" ] || return 1
+
+    local title="$1"
+    local message="$2"
+    local options="$3"
+    local req_id
+    local response
+    local values
+
+    ui_launch_frontend_viewer
+    req_id=$(ui_write_request "checklist" "$title" "$message" \
+        "{\"multiple\":true,\"options\": ${options}}")
+    response=$(ui_wait_response "$req_id" "$UI_FRONTEND_TIMEOUT" "$title") \
+        || ui_handle_timeout "collecting checklist"
+    values=$(printf '%s' "$response" | ui_read_json_array_from_stdin "selected")
+    if [ -z "$values" ]; then
+        values=$(printf '%s' "$response" | ui_read_json_array_from_stdin "value")
+    fi
+
+    ui_cleanup_frontend_entry "$req_id"
+    printf '%s' "$values"
+}
+
+ui_notify() {
+    [ "$UI_FRONTEND_ENABLED" = "1" ] || return 0
+
+    local title="$1"
+    local message="$2"
+    ui_write_request "notice" "$title" "$message" "{}" >/dev/null
+}
+
+# ui_status TITLE [MESSAGE [CURRENT TOTAL [DETAIL]]]
+# Writes a non-blocking status payload that the SmoothGUI client polls via
+# /cgi-bin/status. Use this between blocking ui_prompt_* calls to surface
+# progress during long automated steps (debootstrap, package install,
+# configure, GRUB).
+ui_status() {
+    local title="${1:-}"
+    local message="${2:-}"
+    local current="${3:-}"
+    local total="${4:-}"
+    local detail="${5:-}"
+    local fields=""
+
+    [ -n "$title" ] && fields="${fields}\"title\":\"$(ui_escape_json "$title")\","
+    [ -n "$message" ] && fields="${fields}\"message\":\"$(ui_escape_json "$message")\","
+    if [ -n "$current" ] && [ -n "$total" ]; then
+        fields="${fields}\"current\":${current},\"total\":${total},"
+    fi
+    [ -n "$detail" ] && fields="${fields}\"detail\":\"$(ui_escape_json "$detail")\","
+
+    fields="${fields%,}"
+    mkdir -p "$UI_STATE_DIR" 2>/dev/null || true
+    printf '{%s}\n' "$fields" > "${UI_STATE_DIR}/status.json"
+}
+
+ui_clear_status() {
+    rm -f "${UI_STATE_DIR}/status.json" 2>/dev/null || true
+}
+
+ui_wait() {
+    [ "$UI_FRONTEND_ENABLED" = "1" ] || return 1
+
+    local title="$1"
+    local message="$2"
+    local req_id
+    local response
+
+    ui_launch_frontend_viewer
+    req_id=$(ui_write_request "confirm" "$title" "$message" "{}")
+    response=$(ui_wait_response "$req_id" "$UI_FRONTEND_TIMEOUT" "$title") \
+        || ui_handle_timeout "waiting for installer confirmation"
+    ui_cleanup_frontend_entry "$req_id"
+    return 0
+}
+
+# Ensure the volume group's logical volumes have working /dev/${VG}/${LV}
+# device entries. The d-i installer ships without the LVM udev rules that
+# normally create /dev/dm-N + /dev/mapper/* + /dev/${VG}/${LV} when LVs are
+# activated, so we have to (re)build the chain by hand. mkfs may have
+# succeeded earlier through one of the symlink layers, but mount is
+# stricter and fails with ENODEV when the /dev/dm-N target is missing.
+ensure_lvm_nodes() {
+    local vg="$1"
+    local mapper_name target mapper
+
+    echo "  ensure_lvm_nodes($vg): start"
+
+    mkdir -p /dev/mapper "/dev/${vg}"
+    if [ ! -e /dev/mapper/control ]; then
+        echo "  ensure_lvm_nodes: creating /dev/mapper/control"
+        mknod /dev/mapper/control c 10 236 2>/dev/null || true
+    fi
+
+    echo "  ensure_lvm_nodes: vgchange -ay"
+    vgchange -ay "$vg" 2>&1 | sed 's/^/    /' || true
+    echo "  ensure_lvm_nodes: vgscan --mknodes"
+    vgscan --mknodes 2>&1 | sed 's/^/    /' || true
+    echo "  ensure_lvm_nodes: vgmknodes"
+    vgmknodes "$vg" 2>&1 | sed 's/^/    /' || true
+    if command -v dmsetup >/dev/null 2>&1; then
+        echo "  ensure_lvm_nodes: dmsetup mknodes"
+        dmsetup mknodes 2>&1 | sed 's/^/    /' || true
+    else
+        echo "  ensure_lvm_nodes: dmsetup not present; skipping"
+    fi
+    echo "  ensure_lvm_nodes: udevadm settle"
+    udevadm settle --timeout=5 2>&1 | sed 's/^/    /' || sleep 1
+
+    echo "  ensure_lvm_nodes: lvs snapshot"
+    lvs --noheadings --nosuffix \
+        -o lv_name,lv_kernel_major,lv_kernel_minor "$vg" 2>&1 | sed 's/^/    /' || true
+
+    # Fallback: synthesize the device files directly from lvs's
+    # kernel major:minor when the symlink layers are still broken.
+    # Use a here-string into a plain while-read so we stay in the
+    # outer shell (the subshell `lvs ... | while` swallows variable
+    # writes, which is mostly cosmetic but matters for diagnostics).
+    local lv_dump
+    lv_dump=$(lvs --noheadings --nosuffix \
+        -o lv_name,lv_kernel_major,lv_kernel_minor "$vg" 2>/dev/null || true)
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        # shellcheck disable=SC2086
+        set -- $line
+        local lv="${1:-}" maj="${2:-}" min="${3:-}"
+        [ -n "$lv" ] && [ -n "$maj" ] && [ -n "$min" ] || continue
+        target="/dev/${vg}/${lv}"
+        mapper_name=$(printf '%s' "${vg}" | sed 's/-/--/g')-$(printf '%s' "${lv}" | sed 's/-/--/g')
+        mapper="/dev/mapper/${mapper_name}"
+        if [ -b "$target" ]; then
+            echo "  ensure_lvm_nodes: ${target} already a block device"
+            continue
+        fi
+        echo "  ensure_lvm_nodes: synthesizing ${mapper} -> b ${maj}:${min}"
+        rm -f "$target" 2>/dev/null || true
+        rm -f "$mapper" 2>/dev/null || true
+        mknod "$mapper" b "$maj" "$min" 2>/dev/null || true
+        ln -sf "$mapper" "$target" 2>/dev/null || true
+    done <<EOF
+$lv_dump
+EOF
+
+    echo "  ensure_lvm_nodes: final ls /dev/${vg}"
+    ls -la "/dev/${vg}" 2>&1 | sed 's/^/    /' || true
+    echo "  ensure_lvm_nodes: /dev/mapper listing"
+    ls -la /dev/mapper 2>&1 | sed 's/^/    /' || true
+    echo "  ensure_lvm_nodes: dm-* nodes"
+    ls -la /dev/dm-* 2>&1 | sed 's/^/    /' || true
+
+    [ -e "/dev/${vg}" ] || return 1
+    return 0
+}
+
+# Make sure the named filesystem driver is registered with the kernel,
+# loading it via modprobe / insmod fallbacks if it is not. Required
+# before mount() — mkfs is a userspace operation that does not need a
+# kernel filesystem driver, so it can succeed on a system where mount()
+# would later return ENODEV ("No such device").
+ensure_filesystem_module() {
+    local fs="$1"
+
+    if grep -qE "[[:space:]]${fs}\$" /proc/filesystems 2>/dev/null; then
+        return 0
+    fi
+
+    echo "  ensure_filesystem_module: loading $fs"
+    modprobe "$fs" 2>&1 | sed 's/^/    /' || true
+
+    if grep -qE "[[:space:]]${fs}\$" /proc/filesystems 2>/dev/null; then
+        return 0
+    fi
+
+    # modprobe in the d-i ramdisk fails when modules.dep is missing or
+    # incomplete, so fall back to loading dependency .ko files directly.
+    # Search both /lib/modules and /usr/lib/modules — d-i is not
+    # usr-merged but the host build can be.
+    local deps
+    case "$fs" in
+        ext4) deps="crc16 crc32c_generic mbcache jbd2" ;;
+        ext3|ext2) deps="jbd2 mbcache" ;;
+        vfat) deps="fat nls_cp437 nls_ascii nls_utf8" ;;
+        *) deps="" ;;
+    esac
+    for dep in $deps; do
+        for ko in $(find /lib/modules /usr/lib/modules -name "${dep}.ko*" 2>/dev/null); do
+            insmod "$ko" 2>/dev/null || true
+        done
+    done
+    for ko in $(find /lib/modules /usr/lib/modules -name "${fs}.ko*" 2>/dev/null); do
+        insmod "$ko" 2>/dev/null || true
+    done
+
+    if grep -qE "[[:space:]]${fs}\$" /proc/filesystems 2>/dev/null; then
+        return 0
+    fi
+
+    echo "  ensure_filesystem_module: $fs still missing — /proc/filesystems:"
+    sed 's/^/    /' /proc/filesystems 2>/dev/null || true
+    echo "  ensure_filesystem_module: looked under:"
+    find /lib/modules /usr/lib/modules -maxdepth 4 -name "${fs}.ko*" \
+        2>/dev/null | sed 's/^/    /' || true
+    return 1
 }
 
 # Ensure device mapper is loaded and LVM device nodes exist.
@@ -125,6 +997,25 @@ setup_env() {
 
     export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
+    local kver
+    kver=$(uname -r)
+    # The d-i ramdisk does not have a `modules.dep` file for the
+    # extracted kernel modules, so plain `modprobe` fails with
+    # "can't open 'modules.dep': No such file or directory" and
+    # cannot resolve dependencies. Generate it now from whatever
+    # modules build-iso.sh stamped into /lib/modules/${kver}.
+    # Modern Debian uses a usr-merged layout, but the d-i installer
+    # ramdisk does not, so we cover both paths.
+    local mod_dir=""
+    for candidate in "/lib/modules/${kver}" "/usr/lib/modules/${kver}"; do
+        [ -d "$candidate" ] && { mod_dir="$candidate"; break; }
+    done
+    if [ -n "$mod_dir" ]; then
+        echo "  Generating module dependencies at ${mod_dir}..."
+        depmod -a 2>&1 | sed 's/^/    /' || \
+            depmod -b / "$kver" 2>&1 | sed 's/^/    /' || true
+    fi
+
     echo "  Loading modules..."
     for mod in virtio_pci virtio_scsi virtio_blk sd_mod ahci nvme scsi_mod \
                dm_mod dm_linear dm_striped dm_snapshot; do
@@ -133,28 +1024,21 @@ setup_env() {
     for mod in vfat fat nls_cp437 nls_ascii nls_utf8; do
         modprobe "$mod" 2>/dev/null || true
     done
+    for mod in ext4 jbd2 crc16 crc32c_generic mbcache; do
+        modprobe "$mod" 2>/dev/null || true
+    done
 
-    local kver
-    kver=$(uname -r)
-    local mbase="/usr/lib/modules/${kver}/kernel"
+    local mbase="${mod_dir:-/lib/modules/${kver}}/kernel"
 
     insmod "${mbase}/drivers/md/dm-mod.ko.xz" 2>/dev/null || true
 
-    if ! grep -q ext4 /proc/filesystems 2>/dev/null; then
-        modprobe ext4 2>/dev/null || true
-    fi
-    if ! grep -q ext4 /proc/filesystems 2>/dev/null; then
-        modprobe crc16 2>/dev/null || true
-        modprobe crc32c_generic 2>/dev/null || true
-        modprobe mbcache 2>/dev/null || true
-        insmod "${mbase}/fs/jbd2/jbd2.ko.xz" 2>/dev/null || true
-        insmod "${mbase}/fs/ext4/ext4.ko.xz" 2>/dev/null || true
-    fi
-    if ! grep -q ext4 /proc/filesystems 2>/dev/null; then
-        for ko in $(find /usr/lib/modules -name 'ext4.ko*' 2>/dev/null); do
-            for dep in $(find /usr/lib/modules -name 'jbd2.ko*' 2>/dev/null); do
-                insmod "$dep" 2>/dev/null || true
-            done
+    if ! grep -qE '[[:space:]]ext4$' /proc/filesystems 2>/dev/null; then
+        for ko in $(find /lib/modules /usr/lib/modules \
+            \( -name 'jbd2.ko*' -o -name 'mbcache.ko*' -o -name 'crc16.ko*' \
+               -o -name 'crc32c_generic.ko*' \) 2>/dev/null); do
+            insmod "$ko" 2>/dev/null || true
+        done
+        for ko in $(find /lib/modules /usr/lib/modules -name 'ext4.ko*' 2>/dev/null); do
             insmod "$ko" 2>/dev/null || true
         done
     fi
@@ -174,6 +1058,9 @@ setup_env() {
 
     udevadm trigger 2>/dev/null || true
     udevadm settle --timeout=10 2>/dev/null || sleep 3
+
+    echo "  /proc/filesystems:"
+    sed 's/^/    /' /proc/filesystems 2>/dev/null || true
 }
 
 # ============================================================
@@ -196,28 +1083,71 @@ setup_network() {
     [ -z "$ifaces" ] && die "No network interface found"
 
     echo "  Found $iface_count interface(s): $ifaces"
-    for iface in $ifaces; do ip link set "$iface" up & done
-    wait; sleep 1
-
-    echo "  Trying DHCP on all interfaces..."
-    local dhcp_tmpdir=$(mktemp -d)
+    echo "  Bringing interfaces up..."
+    # Plain `wait` would block on every child of the installer, including
+    # the long-running Firefox/Xorg/dbus/httpd processes spawned from
+    # ui_init_frontend — and hang forever. Capture PIDs and wait only for
+    # the link-up commands.
+    local link_pids=""
     for iface in $ifaces; do
+        ip link set "$iface" up &
+        link_pids="$link_pids $!"
+    done
+    if [ -n "$link_pids" ]; then
+        # shellcheck disable=SC2086
+        wait $link_pids 2>/dev/null || true
+    fi
+    sleep 1
+
+    echo "  Network discovery complete."
+    echo "  Trying DHCP on all interfaces..."
+    local dhcp_tmpdir
+    local dhcp_pid
+    local dhcp_wait=0
+    local dhcp_timeout=18
+    local dhcp_iface
+
+    dhcp_tmpdir="$(mktemp -d)"
+    for iface in $ifaces; do
+        echo "  DHCP attempt on ${iface}..."
         (
             if command -v dhclient >/dev/null 2>&1; then
-                dhclient -v "$iface" -timeout 15 2>/dev/null && \
+                dhclient -v "$iface" 2>/dev/null && \
                     touch "$dhcp_tmpdir/$iface"
             elif command -v udhcpc >/dev/null 2>&1; then
-                udhcpc -i "$iface" -t 5 -n -q 2>/dev/null && \
+                udhcpc -i "$iface" -n -q 2>/dev/null && \
                     touch "$dhcp_tmpdir/$iface"
             fi
         ) &
+        dhcp_pid=$!
+
+        dhcp_wait=0
+        while [ "$dhcp_wait" -lt "$dhcp_timeout" ]; do
+            if [ -f "$dhcp_tmpdir/$iface" ]; then
+                break
+            fi
+            if ! kill -0 "$dhcp_pid" 2>/dev/null; then
+                break
+            fi
+            dhcp_wait=$((dhcp_wait + 1))
+            sleep 1
+        done
+
+        if kill -0 "$dhcp_pid" 2>/dev/null; then
+            kill "$dhcp_pid" 2>/dev/null || true
+            wait "$dhcp_pid" 2>/dev/null || true
+        else
+            wait "$dhcp_pid" 2>/dev/null || true
+        fi
+        if [ ! -f "$dhcp_tmpdir/$iface" ]; then
+            echo "  ${iface}: DHCP did not return an address within ${dhcp_timeout}s."
+        fi
     done
-    wait
 
     local got_ip=0
     for iface in $ifaces; do
         if [ -f "$dhcp_tmpdir/$iface" ]; then
-            local ip_addr
+        local ip_addr
             ip_addr=$(ip -4 addr show "$iface" scope global \
                 | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
             echo "  DHCP succeeded on $iface: $ip_addr"
@@ -242,33 +1172,36 @@ setup_network() {
     echo ""
     echo "  DHCP failed on all interfaces. Manual network configuration required."
     echo ""
+    local manual_ip gateway dns
 
-    if command -v whiptail >/dev/null 2>&1; then
-        local manual_ip
-        manual_ip=$(run_whiptail --title "Network Configuration" \
-            --inputbox "DHCP failed.\n\nConfiguring ${manual_iface} manually.\n\nEnter IP address (CIDR, e.g. 192.168.1.100/24):" \
-            12 60 "")
-        [ -z "$manual_ip" ] && die "No IP address provided."
+    if [ "${SMOOTHISO_SKIP_MANUAL_NETWORK:-1}" = "1" ]; then
+        echo "  Manual network configuration skipped by installer policy."
+        echo "  Continuing without network configuration."
+        return
+    fi
 
-        local gateway
-        gateway=$(run_whiptail --title "Network Configuration" \
-            --inputbox "Enter gateway IP:" 10 60 "")
+    ui_require_frontend
 
-        local dns
-        dns=$(run_whiptail --title "Network Configuration" \
-            --inputbox "Enter DNS server IP:" 10 60 "8.8.8.8")
+    manual_ip=$(ui_prompt_text \
+        "Network Configuration" \
+        "DHCP failed. Configure ${manual_iface} manually.\nEnter IP address (CIDR, e.g. 192.168.1.100/24):" \
+        "")
+    [ -z "$manual_ip" ] && die "No IP address provided."
 
-        ip addr add "$manual_ip" dev "$manual_iface"
-        [ -n "$gateway" ] && ip route add default via "$gateway"
-        [ -n "$dns" ] && echo "nameserver $dns" > /etc/resolv.conf
-    else
-        echo -n "  Enter IP address (CIDR, e.g. 192.168.1.100/24): "
-        read manual_ip
-        echo -n "  Enter gateway: "; read gateway
-        echo -n "  Enter DNS [8.8.8.8]: "; read dns; dns=${dns:-8.8.8.8}
-        ip addr add "$manual_ip" dev "$manual_iface"
-        [ -n "$gateway" ] && ip route add default via "$gateway"
-        echo "nameserver $dns" > /etc/resolv.conf
+    gateway=$(ui_prompt_text \
+        "Network Configuration" \
+        "Enter gateway IP address for ${manual_iface}:" \
+        "")
+    if [ -z "$gateway" ]; then
+        gateway=""
+    fi
+
+    dns=$(ui_prompt_text \
+        "Network Configuration" \
+        "Enter DNS server IP (defaults to 8.8.8.8):" \
+        "8.8.8.8")
+    if [ -z "$dns" ]; then
+        dns="8.8.8.8"
     fi
 
     echo "  Network configured on $manual_iface."
@@ -280,19 +1213,60 @@ setup_network() {
 
 sync_clock() {
     msg "Syncing system clock"
+    local clock_tmpdir
+    local clock_pid
+    local clock_wait=0
+    local clock_timeout=12
 
     if command -v ntpd >/dev/null 2>&1; then
         echo "  Trying NTP sync..."
-        if ntpd -dnqp pool.ntp.org 2>/dev/null; then
-            echo "  Clock set via NTP: $(date -u)"
-            return
+        (
+            ntpd -dnqp pool.ntp.org 2>/dev/null
+        ) &
+        clock_pid=$!
+        while [ "$clock_wait" -lt "$clock_timeout" ]; do
+            if ! kill -0 "$clock_pid" 2>/dev/null; then
+                break
+            fi
+            clock_wait=$((clock_wait + 1))
+            sleep 1
+        done
+        if kill -0 "$clock_pid" 2>/dev/null; then
+            kill "$clock_pid" 2>/dev/null || true
+            wait "$clock_pid" 2>/dev/null || true
+            echo "  NTP failed, falling back to HTTP date..."
+        else
+            if wait "$clock_pid" 2>/dev/null; then
+                echo "  Clock set via NTP: $(date -u)"
+                return
+            fi
+            echo "  NTP failed, falling back to HTTP date..."
         fi
-        echo "  NTP failed, falling back to HTTP date..."
     fi
 
     local http_date=""
-    http_date=$(wget -qS --spider "$DEBIAN_MIRROR/dists/$DEBIAN_SUITE/Release" 2>&1 \
-        | sed -n 's/^ *Date: *//p' | head -1) || true
+    clock_tmpdir="$(mktemp -d)"
+    (
+        wget -qS --spider \
+            "$DEBIAN_MIRROR/dists/$DEBIAN_SUITE/Release" 2>&1 \
+            | sed -n 's/^ *Date: *//p' | head -1 \
+            >"${clock_tmpdir}/http_date.txt"
+    ) &
+    clock_pid=$!
+    clock_wait=0
+    while [ "$clock_wait" -lt "$clock_timeout" ]; do
+        if ! kill -0 "$clock_pid" 2>/dev/null; then
+            break
+        fi
+        clock_wait=$((clock_wait + 1))
+        sleep 1
+    done
+    if kill -0 "$clock_pid" 2>/dev/null; then
+        kill "$clock_pid" 2>/dev/null || true
+        wait "$clock_pid" 2>/dev/null || true
+    fi
+    http_date="$(sed -n '1p' "${clock_tmpdir}/http_date.txt" 2>/dev/null || true)"
+    rm -rf "$clock_tmpdir"
 
     if [ -z "$http_date" ]; then
         echo "  WARNING: Could not fetch date from mirror"
@@ -326,12 +1300,46 @@ sync_clock() {
 # 3. Disk selection
 # ============================================================
 
+# Resolve a stable identifier for a block device, suitable for matching
+# back to a hypervisor / hardware inventory entry from the kiosk. /dev/sdX
+# letters are non-deterministic across boots (depends on virtio-scsi
+# probe order), so the kiosk has to surface something durable.
+#
+# Preference order:
+#   wwn-*    — NAA WWN, present on most physical and many virtio-scsi disks
+#   nvme-*   — NVMe model + serial
+#   scsi-*   — SCSI vendor/product/serial (QEMU virtio-scsi exposes the
+#              PVE slot as `drive-scsi0`, so this directly identifies the
+#              VM-config slot the operator picks)
+#   ata-*    — ATA model + serial
+#   virtio-* — virtio-blk fallback
+disk_stable_id() {
+    local name="$1"
+    local prefix link target
+
+    [ -d /dev/disk/by-id ] || return 0
+    for prefix in wwn nvme scsi ata virtio; do
+        for link in /dev/disk/by-id/${prefix}-*; do
+            [ -L "$link" ] || continue
+            target=$(readlink -f "$link" 2>/dev/null || true)
+            if [ "$target" = "/dev/${name}" ]; then
+                basename "$link"
+                return 0
+            fi
+        done
+    done
+    return 0
+}
+
 select_disks() {
     msg "Disk selection"
 
-    DISK_LIST=""
-    DISK_COUNT=0
-    local unsorted=""
+    # Build a tab-separated table (size, /dev/name, label, description)
+    # so we can sort by size before rendering JSON. Tab is safe — none of
+    # the fields ever contain it.
+    local entries
+    entries=$(mktemp 2>/dev/null || echo /tmp/.smoothiso-disks.$$)
+    : > "$entries"
 
     for dev in /sys/block/*; do
         local name=$(basename "$dev")
@@ -354,103 +1362,58 @@ select_disks() {
         [ "$mounted" = "1" ] && continue
 
         local model=$(cat "$dev/device/model" 2>/dev/null \
-            | sed 's/[[:space:]]*$//' | tr ' ' '_' || echo "Disk")
+            | sed 's/[[:space:]]*$//; s/^[[:space:]]*//' || echo "")
         [ -z "$model" ] && model="Disk"
 
-        unsorted="$unsorted
-$sz /dev/$name ${gb}GB_${model} off"
+        local stable_id
+        stable_id=$(disk_stable_id "$name")
+
+        # Headline visible to the operator: size + vendor/model + the
+        # current /dev/sdX letter (only valid for this boot, but useful
+        # for cross-referencing serial output during the install).
+        local label="${gb} GB · ${model} (/dev/${name})"
+        # Subtitle: the durable identifier they should match against
+        # PVE / their hardware inventory. For virtio-scsi this looks
+        # like `scsi-0QEMU_QEMU_HARDDISK_drive-scsi0`, so the
+        # `drive-scsi0` suffix is the PVE slot name.
+        local desc="$stable_id"
+        [ -z "$desc" ] && desc="(no stable identifier — /dev/${name} only valid for this boot)"
+
+        printf '%s\t/dev/%s\t%s\t%s\n' "$sz" "$name" "$label" "$desc" >> "$entries"
     done
 
-    local sorted=$(echo "$unsorted" | sort -n)
-    local IFS_OLD="$IFS"; IFS='
-'
-    for line in $sorted; do
-        [ -z "$line" ] && continue
-        local entry=$(echo "$line" | sed 's/^[0-9]* //')
-        DISK_LIST="$DISK_LIST $entry"
-        DISK_COUNT=$((DISK_COUNT + 1))
-    done
-    IFS="$IFS_OLD"
-
-    [ "$DISK_COUNT" -eq 0 ] && die "No available disks found"
-
-    local disk_devs="" disk_descs="" disk_sel=""
-    local _field=0
-    for token in $DISK_LIST; do
-        case "$_field" in
-            0) disk_devs="$disk_devs $token"; _field=1 ;;
-            1) disk_descs="$disk_descs $token"; _field=2 ;;
-            2) disk_sel="$disk_sel 0"; _field=0 ;;
-        esac
-    done
-
-    if command -v whiptail >/dev/null 2>&1; then
-        SELECTED_DISKS=$(eval whiptail \
-            --title '"'"${PRODUCT_NAME}"' - Select OS Disk(s)"' \
-            --checklist '"Select one or more disks for the OS.\n\nOne disk: standard LVM.\nTwo or more: RAID-1 mirror + LVM."' \
-            20 70 "$DISK_COUNT" \
-            $DISK_LIST \
-            3>&1 1>&2 2>&3) || true
-        SELECTED_DISKS=$(echo "$SELECTED_DISKS" | tr -d '"')
-    else
-        echo ""
-        echo "  Select disk(s) for the OS install."
-        echo "  One disk = LVM. Two or more = RAID-1 + LVM."
-        echo ""
-
-        while true; do
-            echo "  Available disks:"
-            local idx=1
-            for dev in $disk_devs; do
-                local desc=$(echo "$disk_descs" | awk "{print \$$idx}")
-                local sel=$(echo "$disk_sel" | awk "{print \$$idx}")
-                if [ "$sel" = "1" ]; then
-                    echo "    $idx) [*] $dev  ($desc)"
-                else
-                    echo "    $idx) [ ] $dev  ($desc)"
-                fi
-                idx=$((idx + 1))
-            done
-            echo ""
-            echo -n "  Enter a number to toggle, or 'done' to continue: "
-            read choice
-
-            if [ "$choice" = "done" ] || [ "$choice" = "d" ]; then
-                break
-            fi
-
-            if echo "$choice" | grep -q '^[0-9]*$' && \
-               [ "$choice" -ge 1 ] 2>/dev/null && \
-               [ "$choice" -le "$DISK_COUNT" ] 2>/dev/null; then
-                local new_sel="" t=1
-                for s in $disk_sel; do
-                    if [ "$t" = "$choice" ]; then
-                        [ "$s" = "1" ] && new_sel="$new_sel 0" || new_sel="$new_sel 1"
-                    else
-                        new_sel="$new_sel $s"
-                    fi
-                    t=$((t + 1))
-                done
-                disk_sel="$new_sel"
-            else
-                echo "  Invalid choice."
-            fi
-        done
-
-        SELECTED_DISKS=""
-        local idx=1
-        for dev in $disk_devs; do
-            local sel=$(echo "$disk_sel" | awk "{print \$$idx}")
-            [ "$sel" = "1" ] && SELECTED_DISKS="$SELECTED_DISKS $dev"
-            idx=$((idx + 1))
-        done
-        SELECTED_DISKS=$(echo "$SELECTED_DISKS" | sed 's/^ *//')
+    if [ ! -s "$entries" ]; then
+        rm -f "$entries"
+        die "No available disks found"
     fi
 
+    sort -n -k1,1 "$entries" -o "$entries"
+
+    local ui_disk_options="["
+    while IFS="	" read -r _sz dev label desc; do
+        [ -n "$dev" ] || continue
+        ui_disk_options="${ui_disk_options}{\"value\":\"${dev}\",\"label\":\"$(ui_escape_json "$label")\",\"description\":\"$(ui_escape_json "$desc")\"},"
+    done < "$entries"
+    rm -f "$entries"
+    ui_disk_options="${ui_disk_options%,}]"
+
+    ui_require_frontend
+    local ui_selected
+    ui_selected=$(ui_prompt_checklist \
+        "${PRODUCT_NAME} - Select OS Disk(s)" \
+        'Select one or more disks for the OS.\n\nOne disk: standard LVM.\nTwo or more: RAID-1 mirror + LVM.\n\nThe identifier under each disk is its stable hardware/hypervisor name.' \
+        "$ui_disk_options") || ui_selected=""
+    [ -n "$ui_selected" ] && SELECTED_DISKS="$ui_selected"
     [ -z "$SELECTED_DISKS" ] && die "No disks selected"
 
     SELECTED_COUNT=$(echo "$SELECTED_DISKS" | wc -w)
     echo "  Selected $SELECTED_COUNT disk(s): $SELECTED_DISKS"
+    for d in $SELECTED_DISKS; do
+        local _name=$(basename "$d")
+        local _id
+        _id=$(disk_stable_id "$_name")
+        [ -n "$_id" ] && echo "    ${d}  ->  ${_id}"
+    done
 
     if [ "$SELECTED_COUNT" -gt 1 ]; then
         USE_RAID=1
@@ -470,47 +1433,26 @@ prompt_password() {
 
     ADMIN_PASSWORD=""
 
-    if command -v whiptail >/dev/null 2>&1; then
-        while true; do
-            local pass1
-            pass1=$(run_whiptail \
-                --title "${PRODUCT_NAME} - Admin Password" \
-                --passwordbox "Enter password for the 'admin' account (min 6 characters):" \
-                10 60 "")
-            [ -z "$pass1" ] && die "Password is required"
-            if [ ${#pass1} -lt 6 ]; then
-                whiptail --title "Error" \
-                    --msgbox "Password must be at least 6 characters." 8 50
-                continue
-            fi
-            local pass2
-            pass2=$(run_whiptail \
-                --title "${PRODUCT_NAME} - Confirm Password" \
-                --passwordbox "Confirm password:" 10 60 "")
-            if [ "$pass1" != "$pass2" ]; then
-                whiptail --title "Error" --msgbox "Passwords do not match." 8 50
-                continue
-            fi
-            ADMIN_PASSWORD="$pass1"
-            break
-        done
-    else
-        while true; do
-            echo -n "  Enter admin password (min 6 chars): "
-            stty -echo; read pass1; stty echo; echo ""
-            if [ ${#pass1} -lt 6 ]; then
-                echo "  Password must be at least 6 characters."
-                continue
-            fi
-            echo -n "  Confirm password: "
-            stty -echo; read pass2; stty echo; echo ""
-            if [ "$pass1" != "$pass2" ]; then
-                echo "  Passwords do not match."; continue
-            fi
-            ADMIN_PASSWORD="$pass1"
-            break
-        done
-    fi
+    ui_require_frontend
+    while true; do
+        local pass1
+        pass1=$(ui_prompt_password \
+            "${PRODUCT_NAME} - Admin Password" \
+            "Enter password for the 'admin' account (min 6 characters):") || continue
+        [ -z "$pass1" ] && die "Password is required"
+        if [ ${#pass1} -lt 6 ]; then
+            continue
+        fi
+        local pass2
+        pass2=$(ui_prompt_password \
+            "${PRODUCT_NAME} - Confirm Password" \
+            "Confirm password:") || continue
+        if [ "$pass1" != "$pass2" ]; then
+            continue
+        fi
+        ADMIN_PASSWORD="$pass1"
+        break
+    done
     echo "  Password set."
 }
 
@@ -611,12 +1553,25 @@ partition_single() {
     lvcreate -Wy -y -L 4G -n swap "${VG_NAME}"
     lvcreate -Wy -y -l 100%FREE -n root "${VG_NAME}"
 
-    vgscan --mknodes 2>/dev/null || true
-    vgchange -ay "${VG_NAME}" 2>/dev/null || true
-    udevadm settle --timeout=5 2>/dev/null || sleep 2
+    ensure_lvm_nodes "${VG_NAME}" || \
+        die "Could not bring up /dev/${VG_NAME} after lvcreate"
 
     mkswap "/dev/${VG_NAME}/swap"
     mkfs.ext4 -F "/dev/${VG_NAME}/root"
+
+    # mkfs syncs and closes the dm device; rebuild the node chain again so
+    # the next consumer (mount) sees a fully populated /dev/${VG_NAME}/.
+    ensure_lvm_nodes "${VG_NAME}" || \
+        die "/dev/${VG_NAME}/root vanished after mkfs"
+
+    # mount() needs the filesystem driver registered with the kernel.
+    # mkfs is userspace and writes ext4 metadata directly, so it can
+    # succeed on a system where mount would still ENODEV. Force-load
+    # ext4 + vfat before any mount.
+    ensure_filesystem_module ext4 || \
+        die "ext4 kernel module not registered; cannot mount root"
+    ensure_filesystem_module vfat || \
+        echo "  WARNING: vfat module not registered; EFI mount may fail"
 
     mount -t ext4 "/dev/${VG_NAME}/root" "$TARGET" || \
         die "Failed to mount /dev/${VG_NAME}/root on $TARGET"
@@ -677,9 +1632,8 @@ EOF
     lvcreate -Wy -y -L 4G -n swap "${VG_NAME}"
     lvcreate -Wy -y -l 100%FREE -n root "${VG_NAME}"
 
-    vgscan --mknodes 2>/dev/null || true
-    vgchange -ay "${VG_NAME}" 2>/dev/null || true
-    udevadm settle --timeout=5 2>/dev/null || sleep 2
+    ensure_lvm_nodes "${VG_NAME}" || \
+        die "Could not bring up /dev/${VG_NAME} after lvcreate"
 
     mkswap "/dev/${VG_NAME}/swap"
     mkfs.ext4 -F "/dev/${VG_NAME}/root"
@@ -692,6 +1646,14 @@ EOF
         efi_part="${first_disk}2"
     fi
     mkfs.vfat -F 32 "$efi_part"
+
+    ensure_lvm_nodes "${VG_NAME}" || \
+        die "/dev/${VG_NAME}/root vanished after mkfs"
+
+    ensure_filesystem_module ext4 || \
+        die "ext4 kernel module not registered; cannot mount root"
+    ensure_filesystem_module vfat || \
+        echo "  WARNING: vfat module not registered; EFI mount may fail"
 
     mount -t ext4 "/dev/${VG_NAME}/root" "$TARGET" || \
         die "Failed to mount /dev/${VG_NAME}/root on $TARGET"
@@ -713,6 +1675,7 @@ install_base() {
     command -v debootstrap >/dev/null 2>&1 || \
         die "debootstrap not found in initrd -- rebuild ISO"
 
+    ui_status "Installing base system" "Running debootstrap first stage (downloading Debian ${DEBIAN_SUITE}). This takes a few minutes." 2 6
     echo "  Running debootstrap for ${DEBIAN_SUITE}..."
     debootstrap --foreign --arch=amd64 \
         "$DEBIAN_SUITE" "$TARGET" "$DEBIAN_MIRROR" || \
@@ -737,6 +1700,7 @@ done
 HOOK
     chmod +x "$TARGET/debootstrap/stub-debconf-postinsts"
 
+    ui_status "Installing base system" "Running debootstrap second stage (unpacking and configuring base packages)." 2 6
     echo "  Running debootstrap second stage..."
     DEBIAN_FRONTEND=noninteractive chroot "$TARGET" \
         /debootstrap/debootstrap --second-stage || \
@@ -755,17 +1719,35 @@ HOOK
     done
 
     if [ -n "$stubbed_pkgs" ]; then
+        ui_status "Installing base system" "Reconfiguring deferred postinst scripts." 2 6
         echo "  Reconfiguring:$stubbed_pkgs"
         mount --bind /dev "$TARGET/dev" 2>/dev/null || true
         mount --bind /dev/pts "$TARGET/dev/pts" 2>/dev/null || true
         mount -t proc proc "$TARGET/proc" 2>/dev/null || true
         mount -t sysfs sysfs "$TARGET/sys" 2>/dev/null || true
+        # Stub pam-auth-update inside the chroot before reconfiguring.
+        # libpam-runtime's postinst calls pam-auth-update, which uses
+        # debconf's Perl frontend and hangs in the d-i ramdisk despite
+        # DEBIAN_FRONTEND=noninteractive. The dpkg --configure call
+        # itself is also wrapped in `timeout` so any other postinst
+        # that locks up does not stall the entire install.
+        if [ -f "$TARGET/usr/sbin/pam-auth-update" ] && \
+            [ ! -f "$TARGET/usr/sbin/pam-auth-update.real" ]; then
+            mv "$TARGET/usr/sbin/pam-auth-update" \
+               "$TARGET/usr/sbin/pam-auth-update.real"
+            printf '#!/bin/sh\nexit 0\n' > "$TARGET/usr/sbin/pam-auth-update"
+            chmod +x "$TARGET/usr/sbin/pam-auth-update"
+        fi
         for pkg in $stubbed_pkgs; do
             echo "    Configuring $pkg..."
-            DEBIAN_FRONTEND=noninteractive chroot "$TARGET" \
-                dpkg --configure "$pkg" 2>&1 || \
-                echo "    WARNING: $pkg configure returned non-zero"
+            timeout 60 env DEBIAN_FRONTEND=noninteractive \
+                chroot "$TARGET" dpkg --configure "$pkg" 2>&1 \
+                || echo "    WARNING: $pkg configure returned non-zero"
         done
+        if [ -f "$TARGET/usr/sbin/pam-auth-update.real" ]; then
+            mv "$TARGET/usr/sbin/pam-auth-update.real" \
+               "$TARGET/usr/sbin/pam-auth-update"
+        fi
         umount "$TARGET/sys" "$TARGET/proc" "$TARGET/dev/pts" "$TARGET/dev" \
             2>/dev/null || true
     fi
@@ -828,16 +1810,30 @@ HOOK
         chmod +x "$TARGET/usr/sbin/pam-auth-update"
     fi
 
+    ui_status "Installing packages" "Refreshing package indexes." 3 6
     chroot "$TARGET" apt-get update -qq
 
+    ui_status "Installing packages" "Installing GRUB bootloader packages." 3 6
     echo "  Installing bootloader packages..."
     DEBIAN_FRONTEND=noninteractive chroot "$TARGET" apt-get install -y \
         grub-efi-amd64 grub-pc-bin efibootmgr \
         2>&1 || die "Failed to install GRUB packages"
 
-    echo "  Installing kernel and core packages..."
+    # Kernel packages. Projects that ship their own kernel set
+    # INSTALLER_KERNEL_PACKAGES="" and install it from packages.sh.
+    local kernel_pkgs="${INSTALLER_KERNEL_PACKAGES-linux-image-amd64 linux-headers-amd64}"
+    if [ -n "$kernel_pkgs" ]; then
+        ui_status "Installing packages" "Installing kernel: ${kernel_pkgs}." 3 6
+        echo "  Installing kernel packages: ${kernel_pkgs}..."
+        # shellcheck disable=SC2086
+        DEBIAN_FRONTEND=noninteractive chroot "$TARGET" apt-get install -y -qq \
+            $kernel_pkgs \
+            2>/dev/null || true
+    fi
+
+    ui_status "Installing packages" "Installing LVM, mdadm, SSH, and core utilities." 3 6
+    echo "  Installing core packages..."
     DEBIAN_FRONTEND=noninteractive chroot "$TARGET" apt-get install -y -qq \
-        linux-image-amd64 linux-headers-amd64 \
         lvm2 mdadm \
         openssh-server \
         sudo curl wget ca-certificates \
@@ -845,6 +1841,7 @@ HOOK
         2>/dev/null || true
 
     # Product-specific packages.
+    ui_status "Installing packages" "Installing product-specific packages." 3 6
     if [ -f /smoothiso-hooks/packages.sh ]; then
         echo "  Running project packages hook..."
         . /smoothiso-hooks/packages.sh
@@ -1060,6 +2057,7 @@ GRUB_CMDLINE_LINUX="console=ttyS0,115200n8 console=tty0"
 GRUBCFG
 
     # Rebuild initramfs.
+    ui_status "Configuring system" "Rebuilding initramfs with LVM/RAID support." 4 6
     echo "  Rebuilding initramfs..."
     chroot "$TARGET" update-initramfs -u 2>&1 || true
 
@@ -1118,6 +2116,7 @@ UNIT
 
     # Product-specific configuration.
     if [ -f /smoothiso-hooks/configure.sh ]; then
+        ui_status "Configuring system" "Applying product-specific configuration." 4 6
         echo "  Running project configure hook..."
         . /smoothiso-hooks/configure.sh
     fi
@@ -1136,12 +2135,14 @@ install_grub() {
 
     if [ -d /sys/firmware/efi ]; then
         if chroot "$TARGET" dpkg -l grub-efi-amd64 2>/dev/null | grep -q '^ii'; then
+            ui_status "Installing bootloader" "Installing GRUB for UEFI." 5 6
             echo "  Installing GRUB (UEFI)..."
             chroot "$TARGET" grub-install --target=x86_64-efi \
                 --efi-directory=/boot/efi \
                 --bootloader-id="${PRODUCT_ID}" \
                 --recheck --no-nvram 2>&1 && uefi_ok=1 || \
                 echo "  WARNING: UEFI GRUB install failed"
+            ui_status "Installing bootloader" "Installing GRUB (UEFI removable fallback)." 5 6
             echo "  Installing GRUB (UEFI removable)..."
             chroot "$TARGET" grub-install --target=x86_64-efi \
                 --efi-directory=/boot/efi \
@@ -1152,6 +2153,7 @@ install_grub() {
 
     if chroot "$TARGET" dpkg -l grub-pc-bin 2>/dev/null | grep -q '^ii'; then
         for disk in $SELECTED_DISKS; do
+            ui_status "Installing bootloader" "Installing GRUB (BIOS) to ${disk}." 5 6
             echo "  Installing GRUB (BIOS) to $disk..."
             chroot "$TARGET" grub-install --target=i386-pc "$disk" 2>&1 \
                 && bios_ok=1 || \
@@ -1162,6 +2164,7 @@ install_grub() {
     [ "$uefi_ok" = "0" ] && [ "$bios_ok" = "0" ] && \
         echo "  ERROR: No bootloader installed successfully!"
 
+    ui_status "Installing bootloader" "Generating GRUB configuration." 5 6
     chroot "$TARGET" update-grub 2>&1 || echo "  WARNING: update-grub failed"
     echo "  GRUB installed."
 }
@@ -1190,13 +2193,16 @@ finish() {
     echo "   ${PRODUCT_NAME} Installation Complete"
     echo "  ========================================="
     echo ""
-    echo "   Access: https://${ip_addr:-<your-ip>}"
     echo "   Username: admin"
     echo ""
     echo "   Remove the installation media and"
     echo "   press Enter to reboot."
     echo ""
-    read dummy < /dev/console
+
+    ui_require_frontend
+    ui_wait \
+        "Installation complete" \
+        "Your ${PRODUCT_NAME} installation is finished. Remove installation media and press continue."
 
     echo "Rebooting..."
     sync; sleep 1
@@ -1215,14 +2221,29 @@ echo ""
 echo "  ${PRODUCT_NAME} Installer"
 echo ""
 
+ui_init_frontend
 setup_env
+trap ui_stop_frontend EXIT INT TERM HUP
 setup_network
 sync_clock
 select_disks
 prompt_password
+
+ui_status "Partitioning disks" "Wiping and partitioning the selected disks." 1 6
 do_partitioning
+
+ui_status "Installing base system" "Running debootstrap to install Debian ${DEBIAN_SUITE}. This takes a few minutes." 2 6
 install_base
+
+ui_status "Installing packages" "Installing kernel, bootloader, and product packages." 3 6
 install_packages
+
+ui_status "Configuring system" "Writing fstab, network, GRUB defaults, and product services." 4 6
 configure_system
+
+ui_status "Installing bootloader" "Installing GRUB to the selected disk(s)." 5 6
 install_grub
+
+ui_status "Finalizing" "Finishing up." 6 6
+ui_clear_status
 finish

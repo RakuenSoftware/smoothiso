@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+RESPONSE_DIR="${UI_RESPONSE_DIR:-/run/smoothiso-ui/responses}"
+QUERY="${QUERY_STRING:-}"
+ID=""
+LENGTH="${CONTENT_LENGTH:-0}"
+BODY=""
+
+for pair in $(printf '%s' "$QUERY" | tr '&' ' '); do
+    case "$pair" in
+        id=*) ID="${pair#id=}";;
+    esac
+done
+
+if [ -z "$ID" ]; then
+    printf 'Status: 400 Bad Request\r\n'
+    printf 'Content-Type: application/json\r\n'
+    printf '\r\n'
+    printf '{"error":"missing id"}\n'
+    exit 0
+fi
+
+if [ -n "$LENGTH" ] && [ "$LENGTH" -gt 0 ] 2>/dev/null; then
+    BODY=$(dd bs=1 count="$LENGTH" 2>/dev/null)
+fi
+
+mkdir -p "$RESPONSE_DIR"
+printf '%s' "$BODY" > "${RESPONSE_DIR}/${ID}.json"
+
+printf 'Content-Type: application/json\r\n'
+printf '\r\n'
+printf '{"ok":true,"id":"%s"}\n' "$ID"
