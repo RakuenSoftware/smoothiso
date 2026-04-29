@@ -655,6 +655,22 @@ CONF
         INITRD_TMP="$tmp" bash "${HOOKS_DIR}/embed.sh"
     fi
 
+    # Normalize the usr-merge layout. setup_initrd seeds /lib /bin /sbin
+    # as symlinks to the corresponding usr/ directory, but a non-usr-merged
+    # .deb extraction (firefox-esr aux deps, partitioning tools, etc.) can
+    # clobber the symlink with a real directory, leaving the staging tree
+    # in a shape that won't merge into the d-i initrd (which keeps the
+    # symlinks). Fold any such directory back into usr/<dir>/ and restore
+    # the symlink before the merge.
+    for d in lib bin sbin; do
+        if [ -d "${tmp}/${d}" ] && [ ! -L "${tmp}/${d}" ]; then
+            mkdir -p "${tmp}/usr/${d}"
+            cp -a --no-clobber "${tmp}/${d}/." "${tmp}/usr/${d}/" 2>/dev/null || true
+            rm -rf "${tmp}/${d}"
+            ln -sf "usr/${d}" "${tmp}/${d}"
+        fi
+    done
+
     # Merge into stock initrd (extract, overlay, repack).
     local initrd="${WORK_DIR}/install.${ARCH}/initrd.gz"
     local initrd_root
