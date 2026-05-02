@@ -370,7 +370,15 @@ extract_iso() {
     local candidate
     local listing
     listing=$(xorriso -indev "$src" -ls / 2>/dev/null | sed "s/^[[:space:]]*'\\([^']*\\)'.*$/\\1/")
-    for candidate in "/install.${ARCH}" "/install.amd" "/install"; do
+    # Debian historically uses a short-name install dir per arch:
+    #   amd64 -> /install.amd, arm64 -> /install.a64.
+    local arch_short
+    case "$ARCH" in
+        amd64) arch_short="amd" ;;
+        arm64) arch_short="a64" ;;
+        *)     arch_short="$ARCH" ;;
+    esac
+    for candidate in "/install.${ARCH}" "/install.${arch_short}" "/install"; do
         if echo "$listing" | rg -q "^${candidate#/}$"; then
             install_dir="$candidate"
             break
