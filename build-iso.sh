@@ -53,6 +53,25 @@ DEBIAN_MIRROR="${DEBIAN_MIRROR:-http://deb.debian.org/debian}"
 BOOT_MENU_TITLE="${BOOT_MENU_TITLE:-${PRODUCT_NAME} Install}"
 ISO_LABEL="${ISO_LABEL:-$(echo "$PRODUCT_ID" | tr '[:lower:]' '[:upper:]')}"
 
+# Per-arch knobs. amd64 boots BIOS+UEFI via isolinux + EFI El Torito;
+# arm64 has no BIOS so the source ISO ships no /isolinux tree and the
+# repacked ISO carries only the EFI El Torito record. MULTIARCH_TRIPLET
+# is the lib path used when staging library files into the initrd.
+case "$ARCH" in
+    amd64)
+        MULTIARCH_TRIPLET="x86_64-linux-gnu"
+        BIOS_BOOT=1
+        ;;
+    arm64)
+        MULTIARCH_TRIPLET="aarch64-linux-gnu"
+        BIOS_BOOT=0
+        ;;
+    *)
+        echo "ERROR: unsupported ARCH '${ARCH}' (expected amd64 or arm64)" >&2
+        exit 1
+        ;;
+esac
+
 DEBIAN_ISO_URL="https://cdimage.debian.org/debian-cd/current/${ARCH}/iso-cd/"
 
 # --- Preflight ---
@@ -68,7 +87,7 @@ check_prereqs() {
         echo "ERROR: Missing tools: ${missing[*]}"
         exit 1
     fi
-    if [ ! -f /usr/lib/ISOLINUX/isohdpfx.bin ]; then
+    if [ "$BIOS_BOOT" = "1" ] && [ ! -f /usr/lib/ISOLINUX/isohdpfx.bin ]; then
         echo "ERROR: /usr/lib/ISOLINUX/isohdpfx.bin not found. Install isolinux."
         exit 1
     fi
@@ -280,7 +299,7 @@ install_full_busybox() {
 
         shopt -s nullglob
         candidates=(
-            ${cache_dir}/${busybox_pkg}_*amd64.deb
+            ${cache_dir}/${busybox_pkg}_*${ARCH}.deb
             ${cache_dir}/${busybox_pkg}_*.deb
             ${cache_dir}/${busybox_pkg}-*.deb
         )
@@ -292,7 +311,7 @@ install_full_busybox() {
             }
             shopt -s nullglob
             candidates=(
-                ${cache_dir}/${busybox_pkg}_*amd64.deb
+                ${cache_dir}/${busybox_pkg}_*${ARCH}.deb
                 ${cache_dir}/${busybox_pkg}_*.deb
                 ${cache_dir}/${busybox_pkg}-*.deb
             )
@@ -351,7 +370,15 @@ extract_iso() {
     local candidate
     local listing
     listing=$(xorriso -indev "$src" -ls / 2>/dev/null | sed "s/^[[:space:]]*'\\([^']*\\)'.*$/\\1/")
-    for candidate in "/install.${ARCH}" "/install.amd" "/install"; do
+    # Debian historically uses a short-name install dir per arch:
+    #   amd64 -> /install.amd, arm64 -> /install.a64.
+    local arch_short
+    case "$ARCH" in
+        amd64) arch_short="amd" ;;
+        arm64) arch_short="a64" ;;
+        *)     arch_short="$ARCH" ;;
+    esac
+    for candidate in "/install.${ARCH}" "/install.${arch_short}" "/install"; do
         if echo "$listing" | rg -q "^${candidate#/}$"; then
             install_dir="$candidate"
             break
@@ -365,13 +392,18 @@ extract_iso() {
     local tmp_pool
     tmp_pool=$(mktemp -d)
 
-    xorriso -osirrox on -indev "$src" \
-        -extract "$install_dir"      "$WORK_DIR/install.${ARCH}" \
-        -extract /isolinux           "$WORK_DIR/isolinux" \
-        -extract /boot               "$WORK_DIR/boot" \
-        -extract /EFI                "$WORK_DIR/EFI" \
-        -extract /pool               "$tmp_pool/pool" \
-        2>&1
+    local -a extract_args=(
+        -osirrox on -indev "$src"
+        -extract "$install_dir" "$WORK_DIR/install.${ARCH}"
+        -extract /boot          "$WORK_DIR/boot"
+        -extract /EFI           "$WORK_DIR/EFI"
+        -extract /pool          "$tmp_pool/pool"
+    )
+    # /isolinux only exists on the BIOS-bootable amd64 netinst.
+    if [ "$BIOS_BOOT" = "1" ]; then
+        extract_args+=(-extract /isolinux "$WORK_DIR/isolinux")
+    fi
+    xorriso "${extract_args[@]}" 2>&1
 
     chmod -R u+w "$WORK_DIR"
     chmod -R u+w "$tmp_pool"
@@ -460,8 +492,8 @@ setup_initrd() {
             fi
         done
         find "$pkg_tmp/pkg" -name '*.so*' -type f | while read -r lib; do
-            mkdir -p "${tmp}/usr/lib/x86_64-linux-gnu"
-            cp "$lib" "${tmp}/usr/lib/x86_64-linux-gnu/"
+            mkdir -p "${tmp}/usr/lib/${MULTIARCH_TRIPLET}"
+            cp "$lib" "${tmp}/usr/lib/${MULTIARCH_TRIPLET}/"
         done
         if [ -d "$pkg_tmp/pkg/usr/sbin" ]; then
             find "$pkg_tmp/pkg/usr/sbin" -type l | while read -r link; do
@@ -476,8 +508,8 @@ setup_initrd() {
             local name target
             name=$(basename "$link")
             target=$(readlink "$link")
-            mkdir -p "${tmp}/usr/lib/x86_64-linux-gnu"
-            ln -sf "$target" "${tmp}/usr/lib/x86_64-linux-gnu/${name}"
+            mkdir -p "${tmp}/usr/lib/${MULTIARCH_TRIPLET}"
+            ln -sf "$target" "${tmp}/usr/lib/${MULTIARCH_TRIPLET}/${name}"
         done || true
         rm -rf "$pkg_tmp/pkg"
     }
@@ -610,6 +642,7 @@ PRODUCT_NAME="${PRODUCT_NAME}"
 PRODUCT_ID="${PRODUCT_ID}"
 PRODUCT_HOSTNAME="${PRODUCT_HOSTNAME:-${PRODUCT_ID}}"
 VG_NAME="${VG_NAME:-${PRODUCT_ID}-vg}"
+ARCH="${ARCH}"
 DEBIAN_SUITE="${DEBIAN_SUITE}"
 DEBIAN_MIRROR="${DEBIAN_MIRROR}"
 DATA_DIR="${DATA_DIR:-/var/lib/${PRODUCT_ID}}"
@@ -618,7 +651,7 @@ SMOOTHGUI_FRONTEND_DIR="/smoothiso-ui"
 SMOOTHGUI_FRONTEND_REQUIRED="${SMOOTHGUI_FRONTEND_REQUIRED:-1}"
 SMOOTHGUI_FRONTEND_PORT="${SMOOTHGUI_FRONTEND_PORT:-8080}"
 SMOOTHGUI_FRONTEND_BIND="${SMOOTHGUI_FRONTEND_BIND:-0.0.0.0}"
-INSTALLER_KERNEL_PACKAGES="${INSTALLER_KERNEL_PACKAGES-linux-image-amd64 linux-headers-amd64}"
+INSTALLER_KERNEL_PACKAGES="${INSTALLER_KERNEL_PACKAGES-linux-image-${ARCH} linux-headers-${ARCH}}"
 CONF
 
     # Copy the project's hooks into the initrd.
@@ -689,7 +722,8 @@ CONF
 setup_boot() {
     echo "Configuring boot menu..."
 
-    cat > "${WORK_DIR}/isolinux/isolinux.cfg" << EOF
+    if [ "$BIOS_BOOT" = "1" ]; then
+        cat > "${WORK_DIR}/isolinux/isolinux.cfg" << EOF
 DEFAULT ${PRODUCT_ID}
 TIMEOUT 50
 PROMPT 1
@@ -705,6 +739,7 @@ LABEL bootlocal
     MENU LABEL Boot from first hard disk
     localboot 0x80
 EOF
+    fi
 
     cat > "${WORK_DIR}/boot/grub/grub.cfg" << EOF
 set default=0
@@ -739,20 +774,37 @@ repack_iso() {
         volid="${volid:0:32}"
     fi
 
-    xorriso -as mkisofs \
-        -o "$ISO_OUTPUT_FILE" \
-        -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
-        -c isolinux/boot.cat \
-        -b isolinux/isolinux.bin \
-        -no-emul-boot \
-        -boot-load-size 4 \
-        -boot-info-table \
-        -eltorito-alt-boot \
-        -e boot/grub/efi.img \
-        -no-emul-boot \
-        -isohybrid-gpt-basdat \
-        -V "$volid" \
+    local -a xorriso_args=(
+        -as mkisofs
+        -o "$ISO_OUTPUT_FILE"
+    )
+    if [ "$BIOS_BOOT" = "1" ]; then
+        # amd64: hybrid ISO with isolinux BIOS El Torito + EFI El Torito.
+        xorriso_args+=(
+            -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin
+            -c isolinux/boot.cat
+            -b isolinux/isolinux.bin
+            -no-emul-boot
+            -boot-load-size 4
+            -boot-info-table
+            -eltorito-alt-boot
+            -e boot/grub/efi.img
+            -no-emul-boot
+            -isohybrid-gpt-basdat
+        )
+    else
+        # arm64: no BIOS — EFI-only El Torito record.
+        xorriso_args+=(
+            -e boot/grub/efi.img
+            -no-emul-boot
+            -isohybrid-gpt-basdat
+        )
+    fi
+    xorriso_args+=(
+        -V "$volid"
         "$WORK_DIR"
+    )
+    xorriso "${xorriso_args[@]}"
 
     echo ""
     echo "  ISO: ${ISO_OUTPUT_FILE}"

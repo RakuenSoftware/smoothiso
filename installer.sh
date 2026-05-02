@@ -31,6 +31,7 @@ PRODUCT_NAME="${PRODUCT_NAME:-Linux}"
 PRODUCT_ID="${PRODUCT_ID:-linux}"
 HOSTNAME="${PRODUCT_HOSTNAME:-${PRODUCT_ID}}"
 VG_NAME="${VG_NAME:-${PRODUCT_ID}-vg}"
+ARCH="${ARCH:-amd64}"
 DEBIAN_SUITE="${DEBIAN_SUITE:-trixie}"
 DEBIAN_MIRROR="${DEBIAN_MIRROR:-http://deb.debian.org/debian}"
 DATA_DIR="${DATA_DIR:-/var/lib/${PRODUCT_ID}}"
@@ -1677,7 +1678,7 @@ install_base() {
 
     ui_status "Installing base system" "Running debootstrap first stage (downloading Debian ${DEBIAN_SUITE}). This takes a few minutes." 2 6
     echo "  Running debootstrap for ${DEBIAN_SUITE}..."
-    debootstrap --foreign --arch=amd64 \
+    debootstrap --foreign --arch="$ARCH" \
         "$DEBIAN_SUITE" "$TARGET" "$DEBIAN_MIRROR" || \
         die "debootstrap first stage failed"
 
@@ -1815,13 +1816,19 @@ HOOK
 
     ui_status "Installing packages" "Installing GRUB bootloader packages." 3 6
     echo "  Installing bootloader packages..."
+    case "$ARCH" in
+        amd64) bootloader_pkgs="grub-efi-amd64 grub-pc-bin efibootmgr" ;;
+        arm64) bootloader_pkgs="grub-efi-arm64 efibootmgr" ;;
+        *)     die "Unsupported ARCH: $ARCH" ;;
+    esac
+    # shellcheck disable=SC2086
     DEBIAN_FRONTEND=noninteractive chroot "$TARGET" apt-get install -y \
-        grub-efi-amd64 grub-pc-bin efibootmgr \
+        $bootloader_pkgs \
         2>&1 || die "Failed to install GRUB packages"
 
     # Kernel packages. Projects that ship their own kernel set
     # INSTALLER_KERNEL_PACKAGES="" and install it from packages.sh.
-    local kernel_pkgs="${INSTALLER_KERNEL_PACKAGES-linux-image-amd64 linux-headers-amd64}"
+    local kernel_pkgs="${INSTALLER_KERNEL_PACKAGES-linux-image-${ARCH} linux-headers-${ARCH}}"
     if [ -n "$kernel_pkgs" ]; then
         ui_status "Installing packages" "Installing kernel: ${kernel_pkgs}." 3 6
         echo "  Installing kernel packages: ${kernel_pkgs}..."
@@ -2131,27 +2138,35 @@ UNIT
 install_grub() {
     msg "Installing GRUB bootloader"
 
-    local uefi_ok=0 bios_ok=0
+    local uefi_ok=0 bios_ok=0 efi_pkg efi_target
+
+    case "$ARCH" in
+        amd64) efi_pkg="grub-efi-amd64" ; efi_target="x86_64-efi" ;;
+        arm64) efi_pkg="grub-efi-arm64" ; efi_target="arm64-efi"  ;;
+        *)     die "Unsupported ARCH: $ARCH" ;;
+    esac
 
     if [ -d /sys/firmware/efi ]; then
-        if chroot "$TARGET" dpkg -l grub-efi-amd64 2>/dev/null | grep -q '^ii'; then
+        if chroot "$TARGET" dpkg -l "$efi_pkg" 2>/dev/null | grep -q '^ii'; then
             ui_status "Installing bootloader" "Installing GRUB for UEFI." 5 6
             echo "  Installing GRUB (UEFI)..."
-            chroot "$TARGET" grub-install --target=x86_64-efi \
+            chroot "$TARGET" grub-install --target="$efi_target" \
                 --efi-directory=/boot/efi \
                 --bootloader-id="${PRODUCT_ID}" \
                 --recheck --no-nvram 2>&1 && uefi_ok=1 || \
                 echo "  WARNING: UEFI GRUB install failed"
             ui_status "Installing bootloader" "Installing GRUB (UEFI removable fallback)." 5 6
             echo "  Installing GRUB (UEFI removable)..."
-            chroot "$TARGET" grub-install --target=x86_64-efi \
+            chroot "$TARGET" grub-install --target="$efi_target" \
                 --efi-directory=/boot/efi \
                 --recheck --no-nvram --removable 2>&1 || \
                 echo "  WARNING: UEFI removable install failed"
         fi
     fi
 
-    if chroot "$TARGET" dpkg -l grub-pc-bin 2>/dev/null | grep -q '^ii'; then
+    # BIOS path is amd64-only — arm64 has no grub-pc-bin.
+    if [ "$ARCH" = "amd64" ] && \
+       chroot "$TARGET" dpkg -l grub-pc-bin 2>/dev/null | grep -q '^ii'; then
         for disk in $SELECTED_DISKS; do
             ui_status "Installing bootloader" "Installing GRUB (BIOS) to ${disk}." 5 6
             echo "  Installing GRUB (BIOS) to $disk..."
