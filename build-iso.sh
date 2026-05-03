@@ -397,6 +397,7 @@ extract_iso() {
         -extract "$install_dir" "$WORK_DIR/install.${ARCH}"
         -extract /boot          "$WORK_DIR/boot"
         -extract /EFI           "$WORK_DIR/EFI"
+        -extract /.disk         "$WORK_DIR/.disk"
         -extract /pool          "$tmp_pool/pool"
     )
     # /isolinux only exists on the BIOS-bootable amd64 netinst.
@@ -744,6 +745,7 @@ EOF
     cat > "${WORK_DIR}/boot/grub/grub.cfg" << EOF
 set default=0
 set timeout=5
+set timeout_style=menu
 
 menuentry "${BOOT_MENU_TITLE}" {
     linux /install.${ARCH}/vmlinuz auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 ---
