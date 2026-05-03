@@ -138,7 +138,7 @@ collect_apt_deps() {
 install_installer_browser() {
     local initrd_tmp="$1"
     local browser_pkg="${INSTALLER_BROWSER_PKG:-firefox-esr}"
-    local aux_pkgs="${INSTALLER_BROWSER_AUX_PKGS:-xvfb xinit x11-utils x11-xserver-utils xserver-xorg-core xserver-xorg-input-libinput xserver-xorg-input-evdev xserver-xorg-video-fbdev xserver-xorg-video-vesa xserver-xorg-video-qxl xserver-xorg-video-all xserver-xorg-input-all xfonts-base xfonts-100dpi xfonts-75dpi libegl1 dbus dbus-x11}"
+    local aux_pkgs="${INSTALLER_BROWSER_AUX_PKGS:-xvfb xinit x11-utils x11-xserver-utils xserver-xorg-core xserver-xorg-input-libinput xserver-xorg-input-evdev xserver-xorg-video-fbdev xserver-xorg-video-vesa xserver-xorg-video-qxl xserver-xorg-video-all xserver-xorg-input-all xfonts-base xfonts-100dpi xfonts-75dpi libegl1 dbus dbus-x11 firmware-amd-graphics firmware-misc-nonfree firmware-linux-free}"
     local pkg_cache="${CACHE_DIR}/browser-packages"
     local dep_file="${pkg_cache}/deps.txt"
     local selected_file="${pkg_cache}/selected.txt"
