@@ -26,6 +26,10 @@
 #   INSTALLER_KERNEL_PACKAGES   Kernel packages installed by install_packages.
 #       Default "linux-image-amd64 linux-headers-amd64". Set to "" if the
 #       project ships its own kernel and installs it from packages.sh.
+#   INSTALLER_KERNEL_DEB        Optional path to a linux-image .deb whose
+#       vmlinuz replaces the Debian netinst installer kernel. The deb's
+#       /lib/modules tree is also staged in the initrd so the running kernel
+#       can find its own modules (GPU drivers, etc.).
 #
 # Hook interface (all optional — absence is not an error):
 #   $HOOKS_DIR/embed.sh
@@ -52,6 +56,9 @@ ARCH="${ARCH:-amd64}"
 DEBIAN_MIRROR="${DEBIAN_MIRROR:-http://deb.debian.org/debian}"
 BOOT_MENU_TITLE="${BOOT_MENU_TITLE:-${PRODUCT_NAME} Install}"
 ISO_LABEL="${ISO_LABEL:-$(echo "$PRODUCT_ID" | tr '[:lower:]' '[:upper:]')}"
+INSTALLER_KERNEL_DEB="${INSTALLER_KERNEL_DEB:-}"
+_INSTALLER_KERNEL_KVER=""
+_INSTALLER_KERNEL_MODULES_STAGE=""
 
 # Per-arch knobs. amd64 boots BIOS+UEFI via isolinux + EFI El Torito;
 # arm64 has no BIOS so the source ISO ships no /isolinux tree and the
@@ -412,6 +419,39 @@ extract_iso() {
     POOL_DIR="$tmp_pool/pool"
 }
 
+# --- Optionally replace installer kernel with a project-supplied .deb ---
+
+replace_installer_kernel() {
+    [ -z "$INSTALLER_KERNEL_DEB" ] && return 0
+    echo "Replacing installer kernel with $(basename "$INSTALLER_KERNEL_DEB")..."
+    local kextract
+    kextract=$(mktemp -d)
+    dpkg-deb -x "$INSTALLER_KERNEL_DEB" "$kextract"
+
+    local vmlinuz
+    vmlinuz=$(find "$kextract/boot" -name "vmlinuz-*" -type f | head -1)
+    if [ -z "$vmlinuz" ]; then
+        echo "ERROR: No vmlinuz found in $(basename "$INSTALLER_KERNEL_DEB")" >&2
+        rm -rf "$kextract"
+        exit 1
+    fi
+    _INSTALLER_KERNEL_KVER=$(basename "$vmlinuz" | sed 's/^vmlinuz-//')
+    local kmod_src="$kextract/lib/modules/$_INSTALLER_KERNEL_KVER"
+    if [ ! -d "$kmod_src" ]; then
+        echo "ERROR: No modules directory for $_INSTALLER_KERNEL_KVER in $(basename "$INSTALLER_KERNEL_DEB")" >&2
+        rm -rf "$kextract"
+        exit 1
+    fi
+
+    cp "$vmlinuz" "$WORK_DIR/install.${ARCH}/vmlinuz"
+    echo "  Installer vmlinuz: $_INSTALLER_KERNEL_KVER"
+
+    _INSTALLER_KERNEL_MODULES_STAGE=$(mktemp -d)
+    cp -a "$kmod_src/." "$_INSTALLER_KERNEL_MODULES_STAGE/"
+    rm -rf "$kextract"
+    echo "  Staged $(find "$_INSTALLER_KERNEL_MODULES_STAGE" -name '*.ko*' | wc -l) kernel modules."
+}
+
 # --- Stage installer files and kernel modules into initrd ---
 
 setup_initrd() {
@@ -473,6 +513,12 @@ setup_initrd() {
             rm -rf "$udeb_tmp"
         fi
     done
+
+    if [ -n "$_INSTALLER_KERNEL_KVER" ] && [ -d "$_INSTALLER_KERNEL_MODULES_STAGE" ]; then
+        echo "  Staging custom installer kernel modules ($_INSTALLER_KERNEL_KVER)..."
+        mkdir -p "${tmp}/lib/modules/$_INSTALLER_KERNEL_KVER"
+        cp -a "$_INSTALLER_KERNEL_MODULES_STAGE/." "${tmp}/lib/modules/$_INSTALLER_KERNEL_KVER/"
+    fi
 
     # Partitioning and filesystem tools.
     echo "  Extracting partitioning tools from pool..."
@@ -823,10 +869,12 @@ main() {
     src=$(download_iso)
 
     extract_iso "$src"
+    replace_installer_kernel
     setup_initrd
     setup_boot
     repack_iso
 
+    [ -n "$_INSTALLER_KERNEL_MODULES_STAGE" ] && rm -rf "$_INSTALLER_KERNEL_MODULES_STAGE"
     rm -rf "$WORK_DIR"
     echo "Done."
 }
