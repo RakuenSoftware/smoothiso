@@ -489,7 +489,9 @@ ui_ensure_dbus() {
     local dbus_addr
     local dbus_pid
 
-    dbus_info="$(dbus-daemon --session --fork --print-address --print-pid 2>/tmp/smoothiso-dbus.err || true)"
+    # --print-address=1 and --print-pid=1 write to fd 1 (stdout); using the
+    # =FD form avoids newer dbus-daemon consuming the next flag as the fd arg.
+    dbus_info="$(dbus-daemon --session --fork --print-address=1 --print-pid=1 2>/tmp/smoothiso-dbus.err || true)"
     dbus_addr="$(printf '%s\n' "$dbus_info" | sed -n '1p')"
     dbus_pid="$(printf '%s\n' "$dbus_info" | sed -n '2p')"
     [ -n "$dbus_addr" ] || return 1
