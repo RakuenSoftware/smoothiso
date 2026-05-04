@@ -36,6 +36,18 @@
 #       vmlinuz replaces the Debian netinst installer kernel. The deb's
 #       /lib/modules tree is also staged in the initrd so the running kernel
 #       can find its own modules (GPU drivers, etc.).
+#   INSTALLER_KERNEL_MODULES_FILTER  Space-separated list of module
+#       subdirectory paths (relative to lib/modules/<kver>/) to stage
+#       from INSTALLER_KERNEL_DEB instead of the full module tree. Keeps the
+#       initrd small when only a subset of modules is needed (e.g. GPU drivers).
+#       Always stages modules.* metadata files regardless of the filter.
+#       Default: empty (stage all modules).
+#       Example: "kernel/drivers/gpu kernel/drivers/video kernel/drivers/iommu"
+#   INSTALLER_GPU_FIRMWARE_PKGS  Space-separated list of Debian package names
+#       whose /lib/firmware/ contents are staged into the initrd. Uses
+#       apt-get download on the build host; requires the relevant repos to be
+#       configured. Useful for staging GPU firmware without linux-firmware.
+#       Example: "firmware-amd-graphics"
 #
 # Hook interface (all optional — absence is not an error):
 #   $HOOKS_DIR/embed.sh
@@ -299,6 +311,87 @@ install_installer_browser() {
 POLICIES
 }
 
+install_gpu_firmware() {
+    local initrd_tmp="$1"
+    [ -z "${INSTALLER_GPU_FIRMWARE_PKGS:-}" ] && return 0
+
+    local fw_cache="${CACHE_DIR}/gpu-firmware"
+    mkdir -p "$fw_cache"
+
+    # Source-package pool paths for packages not in standard apt sources
+    # (e.g. non-free-firmware on Ubuntu CI runners).
+    # Keyed by binary package name, value is pool/component/src-prefix.
+    local _amd_pool="non-free-firmware/f/firmware-nonfree"
+    local _intel_pool="non-free-firmware/i/intel-microcode"
+    local _realtek_pool="non-free-firmware/f/firmware-nonfree"
+
+    _fw_pool_path() {
+        case "$1" in
+            firmware-amd-graphics)  echo "$_amd_pool" ;;
+            firmware-intel-graphics) echo "$_intel_pool" ;;
+            firmware-realtek)       echo "$_realtek_pool" ;;
+            *) echo "" ;;
+        esac
+    }
+
+    local pkg
+    for pkg in $INSTALLER_GPU_FIRMWARE_PKGS; do
+        echo "  Staging GPU firmware from ${pkg}..."
+
+        shopt -s nullglob
+        local -a matches=("${fw_cache}/${pkg}_"*.deb "${fw_cache}/${pkg}-"*.deb)
+        shopt -u nullglob
+
+        if [ "${#matches[@]}" -eq 0 ]; then
+            # Try apt-get download first (works on Debian build hosts).
+            if command -v apt-get >/dev/null 2>&1; then
+                (cd "$fw_cache" && apt-get download --quiet "$pkg" 2>&1) || true
+            fi
+            shopt -s nullglob
+            matches=("${fw_cache}/${pkg}_"*.deb "${fw_cache}/${pkg}-"*.deb)
+            shopt -u nullglob
+        fi
+
+        if [ "${#matches[@]}" -eq 0 ]; then
+            # Fall back to direct Debian mirror fetch (works on Ubuntu CI runners).
+            local pool_path
+            pool_path=$(_fw_pool_path "$pkg")
+            if [ -n "$pool_path" ]; then
+                local pool_url="${DEBIAN_MIRROR:-http://deb.debian.org/debian}/pool/${pool_path}/"
+                local deb_name
+                deb_name=$(curl -sL "$pool_url" \
+                    | grep -oP "href=\"${pkg}_[^\"]*_all\\.deb\"" \
+                    | tail -1 | tr -d '"' | sed 's/href=//')
+                if [ -n "$deb_name" ]; then
+                    echo "    Fetching ${deb_name} from Debian mirror..."
+                    curl -fsSL -o "${fw_cache}/${deb_name}" "${pool_url}${deb_name}" || true
+                fi
+                shopt -s nullglob
+                matches=("${fw_cache}/${pkg}_"*.deb "${fw_cache}/${pkg}-"*.deb)
+                shopt -u nullglob
+            fi
+        fi
+
+        if [ "${#matches[@]}" -eq 0 ]; then
+            echo "  WARNING: ${pkg} not found; GPU firmware absent (installer may fail on some hardware)."
+            continue
+        fi
+
+        local deb
+        for deb in "${matches[@]}"; do
+            local fw_tmp
+            fw_tmp=$(mktemp -d)
+            dpkg-deb -x "$deb" "$fw_tmp"
+            if [ -d "$fw_tmp/lib/firmware" ]; then
+                mkdir -p "${initrd_tmp}/lib/firmware"
+                cp -a --no-clobber "$fw_tmp/lib/firmware/." "${initrd_tmp}/lib/firmware/"
+                echo "    Staged firmware from $(basename "$deb")."
+            fi
+            rm -rf "$fw_tmp"
+        done
+    done
+}
+
 install_full_busybox() {
     local initrd_tmp="$1"
     local cache_dir="${CACHE_DIR}/busybox-packages"
@@ -458,7 +551,25 @@ replace_installer_kernel() {
     echo "  Installer vmlinuz: $_INSTALLER_KERNEL_KVER"
 
     _INSTALLER_KERNEL_MODULES_STAGE=$(mktemp -d)
-    cp -a "$kmod_src/." "$_INSTALLER_KERNEL_MODULES_STAGE/"
+    if [ -n "${INSTALLER_KERNEL_MODULES_FILTER:-}" ]; then
+        # Selective staging: only copy the listed subdirectories.
+        # Always copy modules.* metadata so modprobe and Xorg autoloading
+        # can resolve aliases and dependencies for the staged modules.
+        local _filter_path
+        for _filter_path in $INSTALLER_KERNEL_MODULES_FILTER; do
+            if [ -d "${kmod_src}/${_filter_path}" ]; then
+                mkdir -p "${_INSTALLER_KERNEL_MODULES_STAGE}/${_filter_path}"
+                cp -a "${kmod_src}/${_filter_path}/." \
+                    "${_INSTALLER_KERNEL_MODULES_STAGE}/${_filter_path}/"
+            fi
+        done
+        local _meta
+        for _meta in "${kmod_src}"/modules.*; do
+            [ -f "$_meta" ] && cp "$_meta" "$_INSTALLER_KERNEL_MODULES_STAGE/"
+        done
+    else
+        cp -a "$kmod_src/." "$_INSTALLER_KERNEL_MODULES_STAGE/"
+    fi
     rm -rf "$kextract"
     echo "  Staged $(find "$_INSTALLER_KERNEL_MODULES_STAGE" -name '*.ko*' | wc -l) kernel modules."
 }
@@ -647,6 +758,7 @@ setup_initrd() {
 
     install_full_busybox "$tmp"
     install_installer_browser "$tmp"
+    install_gpu_firmware "$tmp"
 
     rm -rf "$pkg_tmp"
 
@@ -713,6 +825,8 @@ INSTALLER_KERNEL_PACKAGES="${INSTALLER_KERNEL_PACKAGES-linux-image-${ARCH} linux
 INSTALLER_BROWSER_DEFERRED="${INSTALLER_BROWSER_DEFERRED:-0}"
 INSTALLER_BROWSER_PKG="${INSTALLER_BROWSER_PKG:-firefox-esr}"
 INSTALLER_BROWSER_AUX_PKGS="${INSTALLER_BROWSER_AUX_PKGS:-xvfb xinit x11-utils x11-xserver-utils xserver-xorg-core xserver-xorg-input-libinput xserver-xorg-input-evdev xserver-xorg-video-fbdev xserver-xorg-video-vesa xserver-xorg-video-qxl xserver-xorg-video-all xserver-xorg-input-all xfonts-base xfonts-100dpi xfonts-75dpi libegl1 dbus dbus-x11 firmware-linux-free}"
+INSTALLER_KERNEL_MODULES_FILTER="${INSTALLER_KERNEL_MODULES_FILTER:-}"
+INSTALLER_GPU_FIRMWARE_PKGS="${INSTALLER_GPU_FIRMWARE_PKGS:-}"
 CONF
 
     # Copy the project's hooks into the initrd.
