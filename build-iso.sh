@@ -138,7 +138,7 @@ collect_apt_deps() {
 install_installer_browser() {
     local initrd_tmp="$1"
     local browser_pkg="${INSTALLER_BROWSER_PKG:-firefox-esr}"
-    local aux_pkgs="${INSTALLER_BROWSER_AUX_PKGS:-xvfb xinit x11-utils x11-xserver-utils xserver-xorg-core xserver-xorg-input-libinput xserver-xorg-input-evdev xserver-xorg-video-fbdev xserver-xorg-video-vesa xserver-xorg-video-qxl xserver-xorg-video-all xserver-xorg-input-all xfonts-base xfonts-100dpi xfonts-75dpi libegl1 dbus dbus-x11 firmware-amd-graphics firmware-misc-nonfree firmware-linux-free}"
+    local aux_pkgs="${INSTALLER_BROWSER_AUX_PKGS:-xvfb xinit x11-utils x11-xserver-utils xserver-xorg-core xserver-xorg-input-libinput xserver-xorg-input-evdev xserver-xorg-video-fbdev xserver-xorg-video-vesa xserver-xorg-video-qxl xserver-xorg-video-all xserver-xorg-input-all xfonts-base xfonts-100dpi xfonts-75dpi libegl1 dbus dbus-x11 firmware-linux-free}"
     local pkg_cache="${CACHE_DIR}/browser-packages"
     local dep_file="${pkg_cache}/deps.txt"
     local selected_file="${pkg_cache}/selected.txt"
@@ -780,7 +780,7 @@ LABEL ${PRODUCT_ID}
     MENU LABEL ${BOOT_MENU_TITLE}
     MENU DEFAULT
     kernel /install.${ARCH}/vmlinuz
-    append auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 initrd=/install.${ARCH}/initrd.gz ---
+    append auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 nomodeset initrd=/install.${ARCH}/initrd.gz ---
 
 LABEL bootlocal
     MENU LABEL Boot from first hard disk
@@ -792,9 +792,12 @@ EOF
 set default=0
 set timeout=5
 set timeout_style=menu
+set gfxmode=auto
+load_video
+set gfxpayload=keep
 
 menuentry "${BOOT_MENU_TITLE}" {
-    linux /install.${ARCH}/vmlinuz auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 ---
+    linux /install.${ARCH}/vmlinuz auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 nomodeset ---
     initrd /install.${ARCH}/initrd.gz
 }
 
