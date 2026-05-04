@@ -794,7 +794,7 @@ LABEL ${PRODUCT_ID}
     MENU LABEL ${BOOT_MENU_TITLE}
     MENU DEFAULT
     kernel /install.${ARCH}/vmlinuz
-    append auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 nomodeset initrd=/install.${ARCH}/initrd.gz ---
+    append auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 initrd=/install.${ARCH}/initrd.gz ---
 
 LABEL bootlocal
     MENU LABEL Boot from first hard disk
@@ -808,7 +808,7 @@ set timeout=5
 set timeout_style=menu
 
 menuentry "${BOOT_MENU_TITLE}" {
-    linux /install.${ARCH}/vmlinuz auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 nomodeset ---
+    linux /install.${ARCH}/vmlinuz auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 ---
     initrd /install.${ARCH}/initrd.gz
 }
 
