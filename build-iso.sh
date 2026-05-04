@@ -792,8 +792,6 @@ EOF
 set default=0
 set timeout=5
 set timeout_style=menu
-set gfxmode=auto
-load_video
 set gfxpayload=keep
 
 menuentry "${BOOT_MENU_TITLE}" {
