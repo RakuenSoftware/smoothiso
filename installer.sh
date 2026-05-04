@@ -1209,7 +1209,40 @@ setup_network() {
 }
 
 # ============================================================
-# 2b. Sync clock
+# 2b. Deferred browser install
+# ============================================================
+
+install_browser_deferred() {
+    [ "${INSTALLER_BROWSER_DEFERRED:-0}" = "1" ] || return 0
+    local browser_pkg="${INSTALLER_BROWSER_PKG:-firefox-esr}"
+    local aux_pkgs="${INSTALLER_BROWSER_AUX_PKGS:-xvfb xinit x11-utils x11-xserver-utils xserver-xorg-core xserver-xorg-input-libinput xserver-xorg-input-evdev xserver-xorg-video-fbdev xserver-xorg-video-vesa xserver-xorg-video-qxl xserver-xorg-video-all xserver-xorg-input-all xfonts-base xfonts-100dpi xfonts-75dpi libegl1 dbus dbus-x11 firmware-linux-free}"
+
+    # Already available — nothing to do.
+    if command -v "$browser_pkg" >/dev/null 2>&1 || \
+       command -v firefox-esr >/dev/null 2>&1 || \
+       command -v firefox >/dev/null 2>&1; then
+        return 0
+    fi
+
+    msg "Downloading installer browser"
+    echo "  Network is up; fetching ${browser_pkg} and display stack from apt..."
+    echo "  (This takes a minute — the installer UI will appear once complete.)"
+
+    if ! apt-get update -qq 2>/dev/null; then
+        echo "  WARNING: apt-get update failed; attempting install anyway."
+    fi
+
+    # shellcheck disable=SC2086
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            "$browser_pkg" $aux_pkgs \
+            2>&1 | grep -v "^debconf:" | sed 's/^/    /'; then
+        die "Failed to install installer browser (${browser_pkg}). Check network."
+    fi
+    echo "  Browser installed."
+}
+
+# ============================================================
+# 2c. Sync clock
 # ============================================================
 
 sync_clock() {
@@ -2236,10 +2269,11 @@ echo ""
 echo "  ${PRODUCT_NAME} Installer"
 echo ""
 
-ui_init_frontend
 setup_env
-trap ui_stop_frontend EXIT INT TERM HUP
 setup_network
+install_browser_deferred
+ui_init_frontend
+trap ui_stop_frontend EXIT INT TERM HUP
 sync_clock
 select_disks
 prompt_password

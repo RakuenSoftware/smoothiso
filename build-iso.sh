@@ -23,6 +23,12 @@
 #   SMOOTHGUI_FRONTEND_REQUIRED  Set to 1 to require SmoothGUI at runtime (default: 1)
 #   SMOOTHGUI_FRONTEND_PORT      Frontend bind port (default: 8080)
 #   SMOOTHGUI_FRONTEND_BIND      Frontend bind address (default: 0.0.0.0)
+#   INSTALLER_BROWSER_DEFERRED  Set to 1 to skip embedding browser packages in
+#       the initrd and download them from apt at installer startup instead.
+#       Requires internet access at install time; eliminates ~300 MB of
+#       browser+X11 packages from the initrd so GRUB can load it cleanly.
+#       INSTALLER_BROWSER_PKG and INSTALLER_BROWSER_AUX_PKGS control what is
+#       downloaded (same variables used for the embedded path).
 #   INSTALLER_KERNEL_PACKAGES   Kernel packages installed by install_packages.
 #       Default "linux-image-amd64 linux-headers-amd64". Set to "" if the
 #       project ships its own kernel and installs it from packages.sh.
@@ -139,6 +145,11 @@ install_installer_browser() {
     local initrd_tmp="$1"
     local browser_pkg="${INSTALLER_BROWSER_PKG:-firefox-esr}"
     local aux_pkgs="${INSTALLER_BROWSER_AUX_PKGS:-xvfb xinit x11-utils x11-xserver-utils xserver-xorg-core xserver-xorg-input-libinput xserver-xorg-input-evdev xserver-xorg-video-fbdev xserver-xorg-video-vesa xserver-xorg-video-qxl xserver-xorg-video-all xserver-xorg-input-all xfonts-base xfonts-100dpi xfonts-75dpi libegl1 dbus dbus-x11 firmware-linux-free}"
+
+    if [ "${INSTALLER_BROWSER_DEFERRED:-0}" = "1" ]; then
+        echo "  INSTALLER_BROWSER_DEFERRED=1: skipping browser embedding; will download at install time."
+        return 0
+    fi
     local pkg_cache="${CACHE_DIR}/browser-packages"
     local dep_file="${pkg_cache}/deps.txt"
     local selected_file="${pkg_cache}/selected.txt"
@@ -699,6 +710,9 @@ SMOOTHGUI_FRONTEND_REQUIRED="${SMOOTHGUI_FRONTEND_REQUIRED:-1}"
 SMOOTHGUI_FRONTEND_PORT="${SMOOTHGUI_FRONTEND_PORT:-8080}"
 SMOOTHGUI_FRONTEND_BIND="${SMOOTHGUI_FRONTEND_BIND:-0.0.0.0}"
 INSTALLER_KERNEL_PACKAGES="${INSTALLER_KERNEL_PACKAGES-linux-image-${ARCH} linux-headers-${ARCH}}"
+INSTALLER_BROWSER_DEFERRED="${INSTALLER_BROWSER_DEFERRED:-0}"
+INSTALLER_BROWSER_PKG="${INSTALLER_BROWSER_PKG:-firefox-esr}"
+INSTALLER_BROWSER_AUX_PKGS="${INSTALLER_BROWSER_AUX_PKGS:-xvfb xinit x11-utils x11-xserver-utils xserver-xorg-core xserver-xorg-input-libinput xserver-xorg-input-evdev xserver-xorg-video-fbdev xserver-xorg-video-vesa xserver-xorg-video-qxl xserver-xorg-video-all xserver-xorg-input-all xfonts-base xfonts-100dpi xfonts-75dpi libegl1 dbus dbus-x11 firmware-linux-free}"
 CONF
 
     # Copy the project's hooks into the initrd.
