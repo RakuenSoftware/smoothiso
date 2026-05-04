@@ -792,7 +792,6 @@ EOF
 set default=0
 set timeout=5
 set timeout_style=menu
-set gfxpayload=keep
 
 menuentry "${BOOT_MENU_TITLE}" {
     linux /install.${ARCH}/vmlinuz auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 nomodeset ---
