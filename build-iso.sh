@@ -594,7 +594,7 @@ find_installer_linux_image_deb() {
     deb=$(find "${POOL_DIR}" -type f \( \
         -name "${pkg}_*_${ARCH}.deb" -o \
         -name "${pkg}-unsigned_*_${ARCH}.deb" \
-    \) | head -1)
+    \) -print -quit)
     if [ -n "$deb" ]; then
         printf '%s\n' "$deb"
         return 0
@@ -631,6 +631,9 @@ find_installer_linux_image_deb() {
     filename=$(curl -fsSL "$packages_url" | gzip -dc | awk -v pkg="$pkg" '
         BEGIN { RS = ""; FS = "\n" }
         {
+            if (printed) {
+                next
+            }
             found = 0
             file = ""
             for (i = 1; i <= NF; i++) {
@@ -639,7 +642,7 @@ find_installer_linux_image_deb() {
             }
             if (found && file != "") {
                 print file
-                exit
+                printed = 1
             }
         }
     ') || true
@@ -670,7 +673,7 @@ stage_installer_gpu_kernel_modules() {
     local kver=""
     if [ -d "${initrd_tmp}/lib/modules" ]; then
         kver=$(find "${initrd_tmp}/lib/modules" -maxdepth 1 -mindepth 1 -type d \
-            -printf '%f\n' 2>/dev/null | head -1)
+            -printf '%f\n' -quit 2>/dev/null)
     fi
     if [ -z "$kver" ]; then
         echo "  WARNING: cannot stage GPU modules; installer kernel version not found."
@@ -723,9 +726,14 @@ stage_installer_gpu_kernel_modules() {
         local name="$1"
         local candidate
         for candidate in "$name" "${name//-/_}" "${name//_/-}"; do
-            find "$module_root" -type f \( -name "${candidate}.ko" -o -name "${candidate}.ko.*" \) \
-                -printf '%P\n' 2>/dev/null | head -1
-        done | head -1
+            local rel
+            rel=$(find "$module_root" -type f \( -name "${candidate}.ko" -o -name "${candidate}.ko.*" \) \
+                -printf '%P\n' -quit 2>/dev/null)
+            if [ -n "$rel" ]; then
+                printf '%s\n' "$rel"
+                return 0
+            fi
+        done
     }
 
     _module_info_strings() {
@@ -757,7 +765,12 @@ stage_installer_gpu_kernel_modules() {
             [ -n "$dep_line" ] && return 0
         fi
 
-        dep_line=$(_module_info_strings "$rel" | sed -n 's/^depends=//p' | head -1 | tr ',' ' ')
+        dep_line=$(_module_info_strings "$rel" | awk '
+            !printed && /^depends=/ {
+                print substr($0, 9)
+                printed = 1
+            }
+        ' | tr ',' ' ')
         for dep_module in $dep_line; do
             dep=$(_module_rel_for_name "$dep_module")
             if [ -n "$dep" ]; then
