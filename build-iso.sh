@@ -384,12 +384,19 @@ install_gpu_firmware() {
         local deb
         for deb in "${matches[@]}"; do
             local fw_tmp
+            local staged=0
             fw_tmp=$(mktemp -d)
             dpkg-deb -x "$deb" "$fw_tmp"
-            if [ -d "$fw_tmp/lib/firmware" ]; then
+            for firmware_dir in "$fw_tmp/lib/firmware" "$fw_tmp/usr/lib/firmware"; do
+                [ -d "$firmware_dir" ] || continue
                 mkdir -p "${initrd_tmp}/lib/firmware"
-                cp -a --no-clobber "$fw_tmp/lib/firmware/." "${initrd_tmp}/lib/firmware/"
+                cp -a --no-clobber "$firmware_dir/." "${initrd_tmp}/lib/firmware/"
+                staged=1
+            done
+            if [ "$staged" = "1" ]; then
                 echo "    Staged firmware from $(basename "$deb")."
+            else
+                echo "    WARNING: $(basename "$deb") did not contain lib/firmware or usr/lib/firmware."
             fi
             rm -rf "$fw_tmp"
         done

@@ -373,6 +373,18 @@ ui_ensure_display() {
         fi
     fi
 
+    if [ -n "$INSTALLER_GPU_KERNEL_MODULES" ] || [ -r /smoothiso-gpu-modules.list ]; then
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm settle --timeout=5 >/dev/null 2>&1 || true
+        fi
+        if [ ! -e /dev/dri/card0 ]; then
+            echo "  WARNING: no /dev/dri/card0 after installer GPU module load." >&2
+            if command -v dmesg >/dev/null 2>&1; then
+                dmesg 2>/dev/null | grep -Ei 'amdgpu|radeon|drm|firmware' | tail -80 >&2 || true
+            fi
+        fi
+    fi
+
     if command -v Xorg >/dev/null 2>&1; then
         mkdir -p /tmp/smoothiso-ui
         local xorg_attempt
