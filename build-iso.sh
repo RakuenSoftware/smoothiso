@@ -48,6 +48,10 @@
 #       apt-get download on the build host; requires the relevant repos to be
 #       configured. Useful for staging GPU firmware without linux-firmware.
 #       Example: "firmware-amd-graphics"
+#   INSTALLER_GPU_KERNEL_MODULES  Space-separated list of installer-kernel GPU
+#       module names to stage from the full linux-image package matching the
+#       Debian installer kernel. Dependencies and modules.* metadata are
+#       included automatically. Example: "amdgpu radeon"
 #
 # Hook interface (all optional — absence is not an error):
 #   $HOOKS_DIR/embed.sh
@@ -574,6 +578,248 @@ replace_installer_kernel() {
     echo "  Staged $(find "$_INSTALLER_KERNEL_MODULES_STAGE" -name '*.ko*' | wc -l) kernel modules."
 }
 
+find_installer_linux_image_deb() {
+    local kver="$1"
+    local pkg="linux-image-${kver}"
+    local kernel_cache="${CACHE_DIR}/kernel-packages"
+    local deb=""
+
+    deb=$(find "${POOL_DIR}" -type f \( \
+        -name "${pkg}_*_${ARCH}.deb" -o \
+        -name "${pkg}-unsigned_*_${ARCH}.deb" \
+    \) | head -1)
+    if [ -n "$deb" ]; then
+        printf '%s\n' "$deb"
+        return 0
+    fi
+
+    mkdir -p "$kernel_cache"
+    shopt -s nullglob
+    local -a matches=(
+        "${kernel_cache}/${pkg}_"*"_${ARCH}.deb"
+        "${kernel_cache}/${pkg}-unsigned_"*"_${ARCH}.deb"
+    )
+    shopt -u nullglob
+    if [ "${#matches[@]}" -gt 0 ]; then
+        printf '%s\n' "${matches[0]}"
+        return 0
+    fi
+
+    if command -v apt-get >/dev/null 2>&1; then
+        (cd "$kernel_cache" && apt-get download --quiet "$pkg" >/dev/null 2>&1) || true
+        shopt -s nullglob
+        matches=(
+            "${kernel_cache}/${pkg}_"*"_${ARCH}.deb"
+            "${kernel_cache}/${pkg}-unsigned_"*"_${ARCH}.deb"
+        )
+        shopt -u nullglob
+        if [ "${#matches[@]}" -gt 0 ]; then
+            printf '%s\n' "${matches[0]}"
+            return 0
+        fi
+    fi
+
+    local packages_url="${DEBIAN_MIRROR%/}/dists/${DEBIAN_SUITE}/main/binary-${ARCH}/Packages.gz"
+    local filename=""
+    filename=$(curl -fsSL "$packages_url" | gzip -dc | awk -v pkg="$pkg" '
+        BEGIN { RS = ""; FS = "\n" }
+        {
+            found = 0
+            file = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i == "Package: " pkg) found = 1
+                if ($i ~ /^Filename: /) file = substr($i, 11)
+            }
+            if (found && file != "") {
+                print file
+                exit
+            }
+        }
+    ') || true
+    if [ -n "$filename" ]; then
+        deb="${kernel_cache}/$(basename "$filename")"
+        if [ ! -f "$deb" ]; then
+            curl -fsSL -o "$deb" "${DEBIAN_MIRROR%/}/${filename}" || true
+        fi
+        if [ -f "$deb" ]; then
+            printf '%s\n' "$deb"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+stage_installer_gpu_kernel_modules() {
+    local initrd_tmp="$1"
+    local requested="${INSTALLER_GPU_KERNEL_MODULES:-}"
+    [ -z "$requested" ] && return 0
+
+    if [ -n "${_INSTALLER_KERNEL_KVER:-}" ]; then
+        echo "  INSTALLER_GPU_KERNEL_MODULES is ignored with INSTALLER_KERNEL_DEB; use INSTALLER_KERNEL_MODULES_FILTER instead."
+        return 0
+    fi
+
+    local kver=""
+    if [ -d "${initrd_tmp}/lib/modules" ]; then
+        kver=$(find "${initrd_tmp}/lib/modules" -maxdepth 1 -mindepth 1 -type d \
+            -printf '%f\n' 2>/dev/null | head -1)
+    fi
+    if [ -z "$kver" ]; then
+        echo "  WARNING: cannot stage GPU modules; installer kernel version not found."
+        return 0
+    fi
+
+    local kernel_deb=""
+    if ! kernel_deb=$(find_installer_linux_image_deb "$kver"); then
+        echo "  WARNING: linux-image-${kver} not found; GPU kernel modules were not staged."
+        return 0
+    fi
+
+    echo "  Staging GPU kernel modules (${requested}) from $(basename "$kernel_deb")..."
+    local kernel_tmp
+    kernel_tmp=$(mktemp -d)
+    dpkg-deb -x "$kernel_deb" "$kernel_tmp"
+
+    local module_root=""
+    if [ -d "$kernel_tmp/lib/modules/$kver" ]; then
+        module_root="$kernel_tmp/lib/modules/$kver"
+    elif [ -d "$kernel_tmp/usr/lib/modules/$kver" ]; then
+        module_root="$kernel_tmp/usr/lib/modules/$kver"
+    fi
+    if [ -z "$module_root" ]; then
+        echo "  WARNING: linux-image package did not contain modules for ${kver}."
+        rm -rf "$kernel_tmp"
+        return 0
+    fi
+    if [ ! -e "$kernel_tmp/lib" ] && [ -d "$kernel_tmp/usr/lib" ]; then
+        ln -s usr/lib "$kernel_tmp/lib"
+    fi
+    if { [ ! -f "$module_root/modules.dep" ] || [ ! -f "$module_root/modules.alias" ]; } && \
+        command -v depmod >/dev/null 2>&1; then
+        depmod -b "$kernel_tmp" "$kver" >/dev/null 2>&1 || \
+            echo "  WARNING: depmod failed for linux-image-${kver}; GPU module dependencies may be incomplete."
+    fi
+
+    mkdir -p "${initrd_tmp}/lib/modules/${kver}"
+    local meta
+    for meta in "$module_root"/modules.*; do
+        [ -f "$meta" ] && cp -a "$meta" "${initrd_tmp}/lib/modules/${kver}/"
+    done
+
+    local dep_file="${module_root}/modules.dep"
+    local softdep_file="${module_root}/modules.softdep"
+    declare -A seen_rel=()
+    local -a ordered_rels=()
+
+    _module_rel_for_name() {
+        local name="$1"
+        local candidate
+        for candidate in "$name" "${name//-/_}" "${name//_/-}"; do
+            find "$module_root" -type f \( -name "${candidate}.ko" -o -name "${candidate}.ko.*" \) \
+                -printf '%P\n' 2>/dev/null | head -1
+        done | head -1
+    }
+
+    _module_info_strings() {
+        local rel="$1"
+        case "$rel" in
+            *.ko.xz)
+                command -v xzcat >/dev/null 2>&1 && xzcat "${module_root}/${rel}"
+                ;;
+            *.ko.zst)
+                command -v zstdcat >/dev/null 2>&1 && zstdcat "${module_root}/${rel}"
+                ;;
+            *.ko.gz)
+                gzip -dc "${module_root}/${rel}"
+                ;;
+            *)
+                cat "${module_root}/${rel}"
+                ;;
+        esac 2>/dev/null | strings 2>/dev/null || true
+    }
+
+    _module_dependency_rels() {
+        local rel="$1"
+        local dep dep_line dep_module
+        if [ -f "$dep_file" ]; then
+            dep_line=$(awk -F: -v rel="$rel" '$1 == rel { print $2; exit }' "$dep_file")
+            for dep in $dep_line; do
+                printf '%s\n' "$dep"
+            done
+            [ -n "$dep_line" ] && return 0
+        fi
+
+        dep_line=$(_module_info_strings "$rel" | sed -n 's/^depends=//p' | head -1 | tr ',' ' ')
+        for dep_module in $dep_line; do
+            dep=$(_module_rel_for_name "$dep_module")
+            if [ -n "$dep" ]; then
+                printf '%s\n' "$dep"
+            else
+                echo "    WARNING: dependency module ${dep_module} not found in linux-image-${kver}." >&2
+            fi
+        done
+    }
+
+    _stage_module_rel() {
+        local rel="$1"
+        local dep
+        [ -n "${seen_rel["$rel"]+x}" ] && return 0
+        seen_rel["$rel"]=1
+
+        while IFS= read -r dep; do
+            [ -n "$dep" ] && _stage_module_rel "$dep"
+        done < <(_module_dependency_rels "$rel")
+
+        if [ -f "${module_root}/${rel}" ]; then
+            mkdir -p "${initrd_tmp}/lib/modules/${kver}/$(dirname "$rel")"
+            cp -a --no-clobber "${module_root}/${rel}" \
+                "${initrd_tmp}/lib/modules/${kver}/${rel}"
+            ordered_rels+=("$rel")
+        else
+            echo "    WARNING: dependency ${rel} not found in linux-image-${kver}."
+        fi
+
+        if [ -f "$softdep_file" ]; then
+            local module_file module_name dep_module dep_rel
+            module_file=$(basename "$rel")
+            module_name="${module_file%%.ko*}"
+            while IFS= read -r dep_module; do
+                [ -z "$dep_module" ] && continue
+                dep_rel=$(_module_rel_for_name "$dep_module")
+                if [ -n "$dep_rel" ]; then
+                    _stage_module_rel "$dep_rel"
+                else
+                    echo "    WARNING: soft dependency module ${dep_module} not found in linux-image-${kver}."
+                fi
+            done < <(awk -v module="$module_name" '
+                $1 == "softdep" && $2 == module {
+                    for (i = 3; i <= NF; i++) {
+                        if ($i != "pre:" && $i != "post:") print $i
+                    }
+                }
+            ' "$softdep_file")
+        fi
+    }
+
+    local module rel
+    for module in $requested; do
+        rel=$(_module_rel_for_name "$module")
+        if [ -n "$rel" ]; then
+            _stage_module_rel "$rel"
+        else
+            echo "    WARNING: module ${module} not found in linux-image-${kver}."
+        fi
+    done
+
+    if [ "${#ordered_rels[@]}" -gt 0 ]; then
+        printf '%s\n' "${ordered_rels[@]}" > "${initrd_tmp}/smoothiso-gpu-modules.list"
+    fi
+
+    echo "    Staged ${#seen_rel[@]} GPU module file(s)."
+    rm -rf "$kernel_tmp"
+}
+
 # --- Stage installer files and kernel modules into initrd ---
 
 setup_initrd() {
@@ -641,6 +887,8 @@ setup_initrd() {
         mkdir -p "${tmp}/lib/modules/$_INSTALLER_KERNEL_KVER"
         cp -a "$_INSTALLER_KERNEL_MODULES_STAGE/." "${tmp}/lib/modules/$_INSTALLER_KERNEL_KVER/"
     fi
+
+    stage_installer_gpu_kernel_modules "$tmp"
 
     # Partitioning and filesystem tools.
     echo "  Extracting partitioning tools from pool..."
@@ -827,6 +1075,7 @@ INSTALLER_BROWSER_PKG="${INSTALLER_BROWSER_PKG:-firefox-esr}"
 INSTALLER_BROWSER_AUX_PKGS="${INSTALLER_BROWSER_AUX_PKGS:-xvfb xinit x11-utils x11-xserver-utils xserver-xorg-core xserver-xorg-input-libinput xserver-xorg-input-evdev xserver-xorg-video-fbdev xserver-xorg-video-vesa xserver-xorg-video-qxl xserver-xorg-video-all xserver-xorg-input-all xfonts-base xfonts-100dpi xfonts-75dpi libegl1 dbus dbus-x11 firmware-linux-free}"
 INSTALLER_KERNEL_MODULES_FILTER="${INSTALLER_KERNEL_MODULES_FILTER:-}"
 INSTALLER_GPU_FIRMWARE_PKGS="${INSTALLER_GPU_FIRMWARE_PKGS:-}"
+INSTALLER_GPU_KERNEL_MODULES="${INSTALLER_GPU_KERNEL_MODULES:-}"
 CONF
 
     # Copy the project's hooks into the initrd.

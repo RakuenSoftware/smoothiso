@@ -65,6 +65,7 @@ SMOOTHGUI_BROWSER_USER="${SMOOTHGUI_BROWSER_USER:-smoothinstaller}"
 SMOOTHGUI_BROWSER_UID="${SMOOTHGUI_BROWSER_UID:-1000}"
 SMOOTHGUI_BROWSER_GID="${SMOOTHGUI_BROWSER_GID:-1000}"
 SMOOTHGUI_FRONTEND_READY_TIMEOUT="${SMOOTHGUI_FRONTEND_READY_TIMEOUT:-25}"
+INSTALLER_GPU_KERNEL_MODULES="${INSTALLER_GPU_KERNEL_MODULES:-}"
 
 # Optional timeout for front-end UI requests (seconds).
 UI_REQUEST_TIMEOUT="${UI_REQUEST_TIMEOUT:-60}"
@@ -333,6 +334,44 @@ ui_ensure_display() {
     fi
     mkdir -p /tmp/.X11-unix 2>/dev/null || true
     chmod 1777 /tmp/.X11-unix 2>/dev/null || true
+
+    local staged_gpu_modules_loaded=0
+    if [ -r /smoothiso-gpu-modules.list ] && command -v insmod >/dev/null 2>&1; then
+        local staged_module_rel
+        local staged_module_path
+        local staged_module_log
+        local running_kernel
+        running_kernel=$(uname -r)
+        while IFS= read -r staged_module_rel; do
+            [ -z "$staged_module_rel" ] && continue
+            staged_module_path="/lib/modules/${running_kernel}/${staged_module_rel}"
+            staged_module_log="/tmp/smoothiso-insmod-$(basename "$staged_module_rel").log"
+            if [ -f "$staged_module_path" ] && \
+                ! insmod "$staged_module_path" >"$staged_module_log" 2>&1; then
+                if ! grep -Eiq 'file exists|already in kernel|module already loaded' "$staged_module_log" 2>/dev/null; then
+                    echo "  WARNING: insmod ${staged_module_rel} failed:" >&2
+                    sed -n '1,80p' "$staged_module_log" >&2 || true
+                fi
+            fi
+        done < /smoothiso-gpu-modules.list
+        staged_gpu_modules_loaded=1
+    fi
+
+    if [ "$staged_gpu_modules_loaded" != "1" ] && \
+        [ -n "$INSTALLER_GPU_KERNEL_MODULES" ] && command -v modprobe >/dev/null 2>&1; then
+        local display_module
+        local modprobe_log
+        for display_module in $INSTALLER_GPU_KERNEL_MODULES; do
+            modprobe_log="/tmp/smoothiso-modprobe-${display_module}.log"
+            if ! modprobe "$display_module" >"$modprobe_log" 2>&1; then
+                echo "  WARNING: modprobe ${display_module} failed:" >&2
+                sed -n '1,80p' "$modprobe_log" >&2 || true
+            fi
+        done
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm settle --timeout=5 >/dev/null 2>&1 || true
+        fi
+    fi
 
     if command -v Xorg >/dev/null 2>&1; then
         mkdir -p /tmp/smoothiso-ui
