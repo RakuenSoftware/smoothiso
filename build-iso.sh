@@ -1079,6 +1079,14 @@ PRESEED
     # may set it to the empty string to opt out of Debian's kernel,
     # and we need to preserve that distinction (set-but-empty vs unset)
     # so installer.sh's `${VAR-default}` expansion respects it.
+    # Determine the in-initrd frontend dir only when assets will be bundled.
+    local _initrd_frontend_dir=""
+    if [ -n "${SMOOTHGUI_FRONTEND_DIR}" ] && [ -d "${SMOOTHGUI_FRONTEND_DIR}" ]; then
+        _initrd_frontend_dir="/smoothiso-ui"
+    elif [ -d "${HOOKS_DIR}/ui" ]; then
+        _initrd_frontend_dir="/smoothiso-ui"
+    fi
+
     cat > "${tmp}/smoothiso-hooks/config.sh" << CONF
 PRODUCT_NAME="${PRODUCT_NAME}"
 PRODUCT_ID="${PRODUCT_ID}"
@@ -1089,7 +1097,7 @@ DEBIAN_SUITE="${DEBIAN_SUITE}"
 DEBIAN_MIRROR="${DEBIAN_MIRROR}"
 DATA_DIR="${DATA_DIR:-/var/lib/${PRODUCT_ID}}"
 TLS_DIR="${TLS_DIR:-/etc/${PRODUCT_ID}/tls}"
-SMOOTHGUI_FRONTEND_DIR="/smoothiso-ui"
+SMOOTHGUI_FRONTEND_DIR="${_initrd_frontend_dir}"
 SMOOTHGUI_FRONTEND_REQUIRED="${SMOOTHGUI_FRONTEND_REQUIRED:-1}"
 SMOOTHGUI_FRONTEND_PORT="${SMOOTHGUI_FRONTEND_PORT:-8080}"
 SMOOTHGUI_FRONTEND_BIND="${SMOOTHGUI_FRONTEND_BIND:-0.0.0.0}"
@@ -1113,14 +1121,17 @@ CONF
         done
     fi
 
-    # Installer frontend assets.
-    mkdir -p "${tmp}/smoothiso-ui"
+    # Installer frontend assets — only create /smoothiso-ui when there are
+    # assets to populate it; an empty directory causes installer.sh to enable
+    # the GUI path and then fail because no index.html is present.
     if [ -n "${SMOOTHGUI_FRONTEND_DIR}" ] && [ -d "${SMOOTHGUI_FRONTEND_DIR}" ]; then
+        mkdir -p "${tmp}/smoothiso-ui"
         cp -a "${SMOOTHGUI_FRONTEND_DIR}/." "${tmp}/smoothiso-ui/"
         if [ -f "${tmp}/smoothiso-ui/index.installer.html" ]; then
             cp "${tmp}/smoothiso-ui/index.installer.html" "${tmp}/smoothiso-ui/index.html"
         fi
     elif [ -d "${HOOKS_DIR}/ui" ]; then
+        mkdir -p "${tmp}/smoothiso-ui"
         cp -a "${HOOKS_DIR}/ui/." "${tmp}/smoothiso-ui/"
     fi
 
