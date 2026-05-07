@@ -66,6 +66,13 @@ SMOOTHGUI_BROWSER_UID="${SMOOTHGUI_BROWSER_UID:-1000}"
 SMOOTHGUI_BROWSER_GID="${SMOOTHGUI_BROWSER_GID:-1000}"
 SMOOTHGUI_FRONTEND_READY_TIMEOUT="${SMOOTHGUI_FRONTEND_READY_TIMEOUT:-25}"
 INSTALLER_GPU_KERNEL_MODULES="${INSTALLER_GPU_KERNEL_MODULES:-}"
+# Space-separated list of "code:Display_Label" pairs offered to the operator
+# as a language choice before installation begins. When empty or a single
+# entry the picker is skipped and INSTALLER_LANG stays at its default.
+INSTALLER_LANGUAGES="${INSTALLER_LANGUAGES:-}"
+# Language selected by the operator (or the default). Hooks can read this
+# to write product-specific locale files into the target filesystem.
+INSTALLER_LANG="${INSTALLER_LANG:-en}"
 
 # Optional timeout for front-end UI requests (seconds).
 UI_REQUEST_TIMEOUT="${UI_REQUEST_TIMEOUT:-60}"
@@ -1234,28 +1241,38 @@ setup_network() {
         return
     fi
 
-    ui_require_frontend
-
-    manual_ip=$(ui_prompt_text \
-        "Network Configuration" \
-        "DHCP failed. Configure ${manual_iface} manually.\nEnter IP address (CIDR, e.g. 192.168.1.100/24):" \
-        "")
-    [ -z "$manual_ip" ] && die "No IP address provided."
-
-    gateway=$(ui_prompt_text \
-        "Network Configuration" \
-        "Enter gateway IP address for ${manual_iface}:" \
-        "")
-    if [ -z "$gateway" ]; then
-        gateway=""
-    fi
-
-    dns=$(ui_prompt_text \
-        "Network Configuration" \
-        "Enter DNS server IP (defaults to 8.8.8.8):" \
-        "8.8.8.8")
-    if [ -z "$dns" ]; then
-        dns="8.8.8.8"
+    if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+        ui_require_frontend
+        manual_ip=$(ui_prompt_text \
+            "Network Configuration" \
+            "DHCP failed. Configure ${manual_iface} manually.\nEnter IP address (CIDR, e.g. 192.168.1.100/24):" \
+            "")
+        [ -z "$manual_ip" ] && die "No IP address provided."
+        gateway=$(ui_prompt_text \
+            "Network Configuration" \
+            "Enter gateway IP address for ${manual_iface}:" \
+            "")
+        if [ -z "$gateway" ]; then gateway=""; fi
+        dns=$(ui_prompt_text \
+            "Network Configuration" \
+            "Enter DNS server IP (defaults to 8.8.8.8):" \
+            "8.8.8.8")
+        if [ -z "$dns" ]; then dns="8.8.8.8"; fi
+    else
+        manual_ip=$(run_whiptail \
+            --title "Network Configuration" \
+            --inputbox "DHCP failed. Configure ${manual_iface} manually.\nEnter IP address (CIDR, e.g. 192.168.1.100/24):" \
+            10 70 "") || manual_ip=""
+        [ -z "$manual_ip" ] && die "No IP address provided."
+        gateway=$(run_whiptail \
+            --title "Network Configuration" \
+            --inputbox "Enter gateway IP address for ${manual_iface}:" \
+            10 60 "") || gateway=""
+        dns=$(run_whiptail \
+            --title "Network Configuration" \
+            --inputbox "Enter DNS server IP (defaults to 8.8.8.8):" \
+            10 60 "8.8.8.8") || dns=""
+        [ -z "$dns" ] && dns="8.8.8.8"
     fi
 
     echo "  Network configured on $manual_iface."
@@ -1384,6 +1401,46 @@ sync_clock() {
 }
 
 # ============================================================
+# 2b. Language selection
+# ============================================================
+
+select_language() {
+    local count
+    count=$(printf '%s' "${INSTALLER_LANGUAGES:-}" | wc -w)
+    [ "$count" -le 1 ] && return 0
+
+    msg "Language selection"
+
+    if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+        # GUI path: not yet wired; fall through to whiptail.
+        true
+    fi
+
+    set --
+    local first=1
+    for lang_entry in $INSTALLER_LANGUAGES; do
+        local code="${lang_entry%%:*}"
+        local label
+        label=$(printf '%s' "${lang_entry#*:}" | tr '_' ' ')
+        if [ "$first" = "1" ]; then
+            set -- "$@" "$code" "$label" "ON"
+            first=0
+        else
+            set -- "$@" "$code" "$label" "OFF"
+        fi
+    done
+
+    local selected
+    selected=$(run_whiptail \
+        --title "${PRODUCT_NAME}" \
+        --radiolist "Select installer language / Kies taal:" \
+        12 50 "$count" "$@") || true
+    selected=$(printf '%s' "$selected" | tr -d '"')
+    [ -n "$selected" ] && INSTALLER_LANG="$selected"
+    echo "  Language: $INSTALLER_LANG"
+}
+
+# ============================================================
 # 3. Disk selection
 # ============================================================
 
@@ -1476,21 +1533,35 @@ select_disks() {
 
     sort -n -k1,1 "$entries" -o "$entries"
 
-    local ui_disk_options="["
-    while IFS="	" read -r _sz dev label desc; do
-        [ -n "$dev" ] || continue
-        ui_disk_options="${ui_disk_options}{\"value\":\"${dev}\",\"label\":\"$(ui_escape_json "$label")\",\"description\":\"$(ui_escape_json "$desc")\"},"
-    done < "$entries"
-    rm -f "$entries"
-    ui_disk_options="${ui_disk_options%,}]"
-
-    ui_require_frontend
-    local ui_selected
-    ui_selected=$(ui_prompt_checklist \
-        "${PRODUCT_NAME} - Select OS Disk(s)" \
-        'Select one or more disks for the OS.\n\nOne disk: standard LVM.\nTwo or more: RAID-1 mirror + LVM.\n\nThe identifier under each disk is its stable hardware/hypervisor name.' \
-        "$ui_disk_options") || ui_selected=""
-    [ -n "$ui_selected" ] && SELECTED_DISKS="$ui_selected"
+    if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+        local ui_disk_options="["
+        while IFS="	" read -r _sz dev label desc; do
+            [ -n "$dev" ] || continue
+            ui_disk_options="${ui_disk_options}{\"value\":\"${dev}\",\"label\":\"$(ui_escape_json "$label")\",\"description\":\"$(ui_escape_json "$desc")\"},"
+        done < "$entries"
+        rm -f "$entries"
+        ui_disk_options="${ui_disk_options%,}]"
+        local ui_selected
+        ui_selected=$(ui_prompt_checklist \
+            "${PRODUCT_NAME} - Select OS Disk(s)" \
+            'Select one or more disks for the OS.\n\nOne disk: standard LVM.\nTwo or more: RAID-1 mirror + LVM.\n\nThe identifier under each disk is its stable hardware/hypervisor name.' \
+            "$ui_disk_options") || ui_selected=""
+        [ -n "$ui_selected" ] && SELECTED_DISKS="$ui_selected"
+    else
+        set --
+        while IFS="	" read -r _sz dev label _desc; do
+            [ -n "$dev" ] || continue
+            set -- "$@" "$dev" "$label" "OFF"
+        done < "$entries"
+        rm -f "$entries"
+        local raw_selected
+        raw_selected=$(run_whiptail \
+            --title "${PRODUCT_NAME} - Select OS Disk(s)" \
+            --checklist \
+            "Select one or more disks for the OS. One disk: LVM. Two or more: RAID-1 mirror + LVM." \
+            20 78 10 "$@") || true
+        SELECTED_DISKS=$(printf '%s' "$raw_selected" | tr -d '"')
+    fi
     [ -z "$SELECTED_DISKS" ] && die "No disks selected"
 
     SELECTED_COUNT=$(echo "$SELECTED_DISKS" | wc -w)
@@ -1520,26 +1591,42 @@ prompt_password() {
 
     ADMIN_PASSWORD=""
 
-    ui_require_frontend
-    while true; do
-        local pass1
-        pass1=$(ui_prompt_password \
-            "${PRODUCT_NAME} - Admin Password" \
-            "Enter password for the 'admin' account (min 6 characters):") || continue
-        [ -z "$pass1" ] && die "Password is required"
-        if [ ${#pass1} -lt 6 ]; then
-            continue
-        fi
-        local pass2
-        pass2=$(ui_prompt_password \
-            "${PRODUCT_NAME} - Confirm Password" \
-            "Confirm password:") || continue
-        if [ "$pass1" != "$pass2" ]; then
-            continue
-        fi
-        ADMIN_PASSWORD="$pass1"
-        break
-    done
+    if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+        ui_require_frontend
+        while true; do
+            local pass1
+            pass1=$(ui_prompt_password \
+                "${PRODUCT_NAME} - Admin Password" \
+                "Enter password for the 'admin' account (min 6 characters):") || continue
+            [ -z "$pass1" ] && die "Password is required"
+            if [ ${#pass1} -lt 6 ]; then continue; fi
+            local pass2
+            pass2=$(ui_prompt_password \
+                "${PRODUCT_NAME} - Confirm Password" \
+                "Confirm password:") || continue
+            if [ "$pass1" != "$pass2" ]; then continue; fi
+            ADMIN_PASSWORD="$pass1"
+            break
+        done
+    else
+        while true; do
+            local pass1
+            pass1=$(run_whiptail \
+                --title "${PRODUCT_NAME} - Admin Password" \
+                --passwordbox "Enter password for the 'admin' account (min 6 characters):" \
+                10 60) || pass1=""
+            [ -z "$pass1" ] && die "Password is required"
+            if [ ${#pass1} -lt 6 ]; then continue; fi
+            local pass2
+            pass2=$(run_whiptail \
+                --title "${PRODUCT_NAME} - Confirm Password" \
+                --passwordbox "Confirm password:" \
+                10 60) || pass2=""
+            if [ "$pass1" != "$pass2" ]; then continue; fi
+            ADMIN_PASSWORD="$pass1"
+            break
+        done
+    fi
     echo "  Password set."
 }
 
@@ -2300,10 +2387,17 @@ finish() {
     echo "   press Enter to reboot."
     echo ""
 
-    ui_require_frontend
-    ui_wait \
-        "Installation complete" \
-        "Your ${PRODUCT_NAME} installation is finished. Remove installation media and press continue."
+    if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+        ui_require_frontend
+        ui_wait \
+            "Installation complete" \
+            "Your ${PRODUCT_NAME} installation is finished. Remove installation media and press continue."
+    else
+        run_whiptail \
+            --title "Installation complete" \
+            --msgbox "Your ${PRODUCT_NAME} installation is finished.\n\nRemove the installation media and press OK to reboot." \
+            12 60 || true
+    fi
 
     echo "Rebooting..."
     sync; sleep 1
@@ -2327,6 +2421,7 @@ setup_network
 install_browser_deferred
 ui_init_frontend
 trap ui_stop_frontend EXIT INT TERM HUP
+select_language
 sync_clock
 select_disks
 prompt_password
