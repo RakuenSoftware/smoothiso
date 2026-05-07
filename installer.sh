@@ -2020,6 +2020,16 @@ HOOK
         systemd-timesyncd systemd-resolved \
         2>/dev/null || true
 
+    # Generate the CA trust bundle now so HTTPS works for tools (curl/wget)
+    # used by project hooks. ca-certificates' postinst is stubbed by the
+    # debconf pre-invoke hook, so /etc/ssl/certs/ca-certificates.crt would
+    # otherwise stay empty until the post-hook cleanup runs.
+    chroot "$TARGET" sh -c '
+        find /usr/share/ca-certificates -name "*.crt" -printf "%P\n" | sort \
+            > /etc/ca-certificates.conf
+        update-ca-certificates --fresh
+    ' 2>/dev/null || true
+
     # Product-specific packages.
     ui_status "Installing packages" "Installing product-specific packages." 3 6
     if [ -f /smoothiso-hooks/packages.sh ]; then
@@ -2043,12 +2053,6 @@ HOOK
         [ -f "$real" ] || continue
         mv "$real" "${real%.real}"
     done
-
-    chroot "$TARGET" sh -c '
-        find /usr/share/ca-certificates -name "*.crt" -printf "%P\n" | sort \
-            > /etc/ca-certificates.conf
-        update-ca-certificates --fresh
-    ' 2>/dev/null || true
 
     # Generate PAM config directly (pam-auth-update uses debconf and hangs).
     echo "  Generating PAM configuration..."
