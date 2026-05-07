@@ -66,6 +66,13 @@ SMOOTHGUI_BROWSER_UID="${SMOOTHGUI_BROWSER_UID:-1000}"
 SMOOTHGUI_BROWSER_GID="${SMOOTHGUI_BROWSER_GID:-1000}"
 SMOOTHGUI_FRONTEND_READY_TIMEOUT="${SMOOTHGUI_FRONTEND_READY_TIMEOUT:-25}"
 INSTALLER_GPU_KERNEL_MODULES="${INSTALLER_GPU_KERNEL_MODULES:-}"
+# Space-separated list of "code:Display_Label" pairs offered to the operator
+# as a language choice before installation begins. When empty or a single
+# entry the picker is skipped and INSTALLER_LANG stays at its default.
+INSTALLER_LANGUAGES="${INSTALLER_LANGUAGES:-}"
+# Language selected by the operator (or the default). Hooks can read this
+# to write product-specific locale files into the target filesystem.
+INSTALLER_LANG="${INSTALLER_LANG:-en}"
 
 # Optional timeout for front-end UI requests (seconds).
 UI_REQUEST_TIMEOUT="${UI_REQUEST_TIMEOUT:-60}"
@@ -1394,6 +1401,46 @@ sync_clock() {
 }
 
 # ============================================================
+# 2b. Language selection
+# ============================================================
+
+select_language() {
+    local count
+    count=$(printf '%s' "${INSTALLER_LANGUAGES:-}" | wc -w)
+    [ "$count" -le 1 ] && return 0
+
+    msg "Language selection"
+
+    if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+        # GUI path: not yet wired; fall through to whiptail.
+        true
+    fi
+
+    set --
+    local first=1
+    for lang_entry in $INSTALLER_LANGUAGES; do
+        local code="${lang_entry%%:*}"
+        local label
+        label=$(printf '%s' "${lang_entry#*:}" | tr '_' ' ')
+        if [ "$first" = "1" ]; then
+            set -- "$@" "$code" "$label" "ON"
+            first=0
+        else
+            set -- "$@" "$code" "$label" "OFF"
+        fi
+    done
+
+    local selected
+    selected=$(run_whiptail \
+        --title "${PRODUCT_NAME}" \
+        --radiolist "Select installer language / Kies taal:" \
+        12 50 "$count" "$@") || true
+    selected=$(printf '%s' "$selected" | tr -d '"')
+    [ -n "$selected" ] && INSTALLER_LANG="$selected"
+    echo "  Language: $INSTALLER_LANG"
+}
+
+# ============================================================
 # 3. Disk selection
 # ============================================================
 
@@ -2374,6 +2421,7 @@ setup_network
 install_browser_deferred
 ui_init_frontend
 trap ui_stop_frontend EXIT INT TERM HUP
+select_language
 sync_clock
 select_disks
 prompt_password
