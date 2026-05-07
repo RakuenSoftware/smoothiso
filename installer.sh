@@ -1234,28 +1234,38 @@ setup_network() {
         return
     fi
 
-    ui_require_frontend
-
-    manual_ip=$(ui_prompt_text \
-        "Network Configuration" \
-        "DHCP failed. Configure ${manual_iface} manually.\nEnter IP address (CIDR, e.g. 192.168.1.100/24):" \
-        "")
-    [ -z "$manual_ip" ] && die "No IP address provided."
-
-    gateway=$(ui_prompt_text \
-        "Network Configuration" \
-        "Enter gateway IP address for ${manual_iface}:" \
-        "")
-    if [ -z "$gateway" ]; then
-        gateway=""
-    fi
-
-    dns=$(ui_prompt_text \
-        "Network Configuration" \
-        "Enter DNS server IP (defaults to 8.8.8.8):" \
-        "8.8.8.8")
-    if [ -z "$dns" ]; then
-        dns="8.8.8.8"
+    if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+        ui_require_frontend
+        manual_ip=$(ui_prompt_text \
+            "Network Configuration" \
+            "DHCP failed. Configure ${manual_iface} manually.\nEnter IP address (CIDR, e.g. 192.168.1.100/24):" \
+            "")
+        [ -z "$manual_ip" ] && die "No IP address provided."
+        gateway=$(ui_prompt_text \
+            "Network Configuration" \
+            "Enter gateway IP address for ${manual_iface}:" \
+            "")
+        if [ -z "$gateway" ]; then gateway=""; fi
+        dns=$(ui_prompt_text \
+            "Network Configuration" \
+            "Enter DNS server IP (defaults to 8.8.8.8):" \
+            "8.8.8.8")
+        if [ -z "$dns" ]; then dns="8.8.8.8"; fi
+    else
+        manual_ip=$(run_whiptail \
+            --title "Network Configuration" \
+            --inputbox "DHCP failed. Configure ${manual_iface} manually.\nEnter IP address (CIDR, e.g. 192.168.1.100/24):" \
+            10 70 "") || manual_ip=""
+        [ -z "$manual_ip" ] && die "No IP address provided."
+        gateway=$(run_whiptail \
+            --title "Network Configuration" \
+            --inputbox "Enter gateway IP address for ${manual_iface}:" \
+            10 60 "") || gateway=""
+        dns=$(run_whiptail \
+            --title "Network Configuration" \
+            --inputbox "Enter DNS server IP (defaults to 8.8.8.8):" \
+            10 60 "8.8.8.8") || dns=""
+        [ -z "$dns" ] && dns="8.8.8.8"
     fi
 
     echo "  Network configured on $manual_iface."
@@ -1476,21 +1486,35 @@ select_disks() {
 
     sort -n -k1,1 "$entries" -o "$entries"
 
-    local ui_disk_options="["
-    while IFS="	" read -r _sz dev label desc; do
-        [ -n "$dev" ] || continue
-        ui_disk_options="${ui_disk_options}{\"value\":\"${dev}\",\"label\":\"$(ui_escape_json "$label")\",\"description\":\"$(ui_escape_json "$desc")\"},"
-    done < "$entries"
-    rm -f "$entries"
-    ui_disk_options="${ui_disk_options%,}]"
-
-    ui_require_frontend
-    local ui_selected
-    ui_selected=$(ui_prompt_checklist \
-        "${PRODUCT_NAME} - Select OS Disk(s)" \
-        'Select one or more disks for the OS.\n\nOne disk: standard LVM.\nTwo or more: RAID-1 mirror + LVM.\n\nThe identifier under each disk is its stable hardware/hypervisor name.' \
-        "$ui_disk_options") || ui_selected=""
-    [ -n "$ui_selected" ] && SELECTED_DISKS="$ui_selected"
+    if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+        local ui_disk_options="["
+        while IFS="	" read -r _sz dev label desc; do
+            [ -n "$dev" ] || continue
+            ui_disk_options="${ui_disk_options}{\"value\":\"${dev}\",\"label\":\"$(ui_escape_json "$label")\",\"description\":\"$(ui_escape_json "$desc")\"},"
+        done < "$entries"
+        rm -f "$entries"
+        ui_disk_options="${ui_disk_options%,}]"
+        local ui_selected
+        ui_selected=$(ui_prompt_checklist \
+            "${PRODUCT_NAME} - Select OS Disk(s)" \
+            'Select one or more disks for the OS.\n\nOne disk: standard LVM.\nTwo or more: RAID-1 mirror + LVM.\n\nThe identifier under each disk is its stable hardware/hypervisor name.' \
+            "$ui_disk_options") || ui_selected=""
+        [ -n "$ui_selected" ] && SELECTED_DISKS="$ui_selected"
+    else
+        set --
+        while IFS="	" read -r _sz dev label _desc; do
+            [ -n "$dev" ] || continue
+            set -- "$@" "$dev" "$label" "OFF"
+        done < "$entries"
+        rm -f "$entries"
+        local raw_selected
+        raw_selected=$(run_whiptail \
+            --title "${PRODUCT_NAME} - Select OS Disk(s)" \
+            --checklist \
+            "Select one or more disks for the OS. One disk: LVM. Two or more: RAID-1 mirror + LVM." \
+            20 78 10 "$@") || true
+        SELECTED_DISKS=$(printf '%s' "$raw_selected" | tr -d '"')
+    fi
     [ -z "$SELECTED_DISKS" ] && die "No disks selected"
 
     SELECTED_COUNT=$(echo "$SELECTED_DISKS" | wc -w)
@@ -1520,26 +1544,42 @@ prompt_password() {
 
     ADMIN_PASSWORD=""
 
-    ui_require_frontend
-    while true; do
-        local pass1
-        pass1=$(ui_prompt_password \
-            "${PRODUCT_NAME} - Admin Password" \
-            "Enter password for the 'admin' account (min 6 characters):") || continue
-        [ -z "$pass1" ] && die "Password is required"
-        if [ ${#pass1} -lt 6 ]; then
-            continue
-        fi
-        local pass2
-        pass2=$(ui_prompt_password \
-            "${PRODUCT_NAME} - Confirm Password" \
-            "Confirm password:") || continue
-        if [ "$pass1" != "$pass2" ]; then
-            continue
-        fi
-        ADMIN_PASSWORD="$pass1"
-        break
-    done
+    if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+        ui_require_frontend
+        while true; do
+            local pass1
+            pass1=$(ui_prompt_password \
+                "${PRODUCT_NAME} - Admin Password" \
+                "Enter password for the 'admin' account (min 6 characters):") || continue
+            [ -z "$pass1" ] && die "Password is required"
+            if [ ${#pass1} -lt 6 ]; then continue; fi
+            local pass2
+            pass2=$(ui_prompt_password \
+                "${PRODUCT_NAME} - Confirm Password" \
+                "Confirm password:") || continue
+            if [ "$pass1" != "$pass2" ]; then continue; fi
+            ADMIN_PASSWORD="$pass1"
+            break
+        done
+    else
+        while true; do
+            local pass1
+            pass1=$(run_whiptail \
+                --title "${PRODUCT_NAME} - Admin Password" \
+                --passwordbox "Enter password for the 'admin' account (min 6 characters):" \
+                10 60) || pass1=""
+            [ -z "$pass1" ] && die "Password is required"
+            if [ ${#pass1} -lt 6 ]; then continue; fi
+            local pass2
+            pass2=$(run_whiptail \
+                --title "${PRODUCT_NAME} - Confirm Password" \
+                --passwordbox "Confirm password:" \
+                10 60) || pass2=""
+            if [ "$pass1" != "$pass2" ]; then continue; fi
+            ADMIN_PASSWORD="$pass1"
+            break
+        done
+    fi
     echo "  Password set."
 }
 
@@ -2300,10 +2340,17 @@ finish() {
     echo "   press Enter to reboot."
     echo ""
 
-    ui_require_frontend
-    ui_wait \
-        "Installation complete" \
-        "Your ${PRODUCT_NAME} installation is finished. Remove installation media and press continue."
+    if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+        ui_require_frontend
+        ui_wait \
+            "Installation complete" \
+            "Your ${PRODUCT_NAME} installation is finished. Remove installation media and press continue."
+    else
+        run_whiptail \
+            --title "Installation complete" \
+            --msgbox "Your ${PRODUCT_NAME} installation is finished.\n\nRemove the installation media and press OK to reboot." \
+            12 60 || true
+    fi
 
     echo "Rebooting..."
     sync; sleep 1
