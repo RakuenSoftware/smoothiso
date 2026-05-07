@@ -2025,17 +2025,14 @@ HOOK
     # debconf pre-invoke hook, so /etc/ssl/certs/ca-certificates.crt would
     # otherwise stay empty until the post-hook cleanup runs.
     #
-    # Run the saved .real postinst if present (canonical setup); fall back
-    # to writing /etc/ca-certificates.conf manually. Use `find . | sed`
-    # rather than `-printf "%P\n"` so the result is identical regardless
-    # of which find implementation handles it.
+    # Do NOT call ca-certificates.postinst.real here — it sources
+    # /usr/share/debconf/confmodule and blocks waiting for debconf I/O in
+    # the d-i environment (the same reason every other debconf postinst is
+    # stubbed). Build /etc/ca-certificates.conf manually with a portable
+    # `find . | sed` pipeline (no -printf — that flag silently produced an
+    # empty file in some target environments, which left the bundle empty).
     chroot "$TARGET" sh -c '
-        if [ -x /var/lib/dpkg/info/ca-certificates.postinst.real ]; then
-            DEBIAN_FRONTEND=noninteractive \
-                /var/lib/dpkg/info/ca-certificates.postinst.real configure ""
-        fi
-        if [ ! -s /etc/ssl/certs/ca-certificates.crt ] \
-            && [ -d /usr/share/ca-certificates ]; then
+        if [ -d /usr/share/ca-certificates ]; then
             ( cd /usr/share/ca-certificates \
                 && find . -name "*.crt" -type f \
                 | sed "s|^\./||" | sort > /etc/ca-certificates.conf )
