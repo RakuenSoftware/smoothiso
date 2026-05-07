@@ -2024,10 +2024,23 @@ HOOK
     # used by project hooks. ca-certificates' postinst is stubbed by the
     # debconf pre-invoke hook, so /etc/ssl/certs/ca-certificates.crt would
     # otherwise stay empty until the post-hook cleanup runs.
+    #
+    # Run the saved .real postinst if present (canonical setup); fall back
+    # to writing /etc/ca-certificates.conf manually. Use `find . | sed`
+    # rather than `-printf "%P\n"` so the result is identical regardless
+    # of which find implementation handles it.
     chroot "$TARGET" sh -c '
-        find /usr/share/ca-certificates -name "*.crt" -printf "%P\n" | sort \
-            > /etc/ca-certificates.conf
-        update-ca-certificates --fresh
+        if [ -x /var/lib/dpkg/info/ca-certificates.postinst.real ]; then
+            DEBIAN_FRONTEND=noninteractive \
+                /var/lib/dpkg/info/ca-certificates.postinst.real configure ""
+        fi
+        if [ ! -s /etc/ssl/certs/ca-certificates.crt ] \
+            && [ -d /usr/share/ca-certificates ]; then
+            ( cd /usr/share/ca-certificates \
+                && find . -name "*.crt" -type f \
+                | sed "s|^\./||" | sort > /etc/ca-certificates.conf )
+            update-ca-certificates --fresh
+        fi
     ' 2>/dev/null || true
 
     # Product-specific packages.
