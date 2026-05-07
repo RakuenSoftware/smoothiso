@@ -195,63 +195,59 @@ install_installer_browser() {
     : > "$selected_file"
     local -A selected
     local package
-    while IFS= read -r package; do
-        local targets="${package} ${aux_pkgs}"
-        local target
-        for target in $targets; do
-            [ -z "$target" ] && continue
 
-            shopt -s nullglob
-            local matches=(
-                ${pkg_cache}/${target}_*.deb
-                ${pkg_cache}/${target}-*.deb
-            )
-            shopt -u nullglob
-            if [ "${#matches[@]}" -eq 0 ]; then
-                if (cd "$pkg_cache" && apt-get download --quiet "$target"); then
-                    :
-                else
-                    echo "  WARNING: unable to download ${target}; installer browser may be incomplete."
-                fi
-            fi
-            shopt -s nullglob
-            matches=(
-                ${pkg_cache}/${target}_*.deb
-                ${pkg_cache}/${target}-*.deb
-            )
-            shopt -u nullglob
-            for package_file in "${matches[@]}"; do
-                selected["$package_file"]=1
-            done
+    # Try once to download a package; remember failures so we don't retry
+    # the same failing download on every iteration of the outer loops. A
+    # missing package on the build host (e.g. firmware-linux-free is not
+    # in Ubuntu) used to be retried hundreds of times, adding ~30 min to
+    # builds.
+    _try_download_pkg() {
+        local target="$1"
+        shopt -s nullglob
+        local matches=(
+            ${pkg_cache}/${target}_*.deb
+            ${pkg_cache}/${target}-*.deb
+        )
+        shopt -u nullglob
+        if [ "${#matches[@]}" -gt 0 ]; then
+            return 0
+        fi
+        if [ -f "${pkg_cache}/.failed-${target}" ]; then
+            return 1
+        fi
+        if (cd "$pkg_cache" && apt-get download --quiet "$target"); then
+            return 0
+        fi
+        : > "${pkg_cache}/.failed-${target}"
+        echo "  WARNING: unable to download ${target}; installer browser may be incomplete."
+        return 1
+    }
+
+    _record_matches() {
+        local target="$1"
+        shopt -s nullglob
+        local matches=(
+            ${pkg_cache}/${target}_*.deb
+            ${pkg_cache}/${target}-*.deb
+        )
+        shopt -u nullglob
+        for package_file in "${matches[@]}"; do
+            selected["$package_file"]=1
         done
+    }
+
+    while IFS= read -r package; do
+        [ -z "$package" ] && continue
+        _try_download_pkg "$package" || true
+        _record_matches "$package"
     done < "$dep_file"
 
     if [ -n "$aux_pkgs" ]; then
         local aux
         for aux in $aux_pkgs; do
-            shopt -s nullglob
-                local aux_matches=(
-                ${pkg_cache}/${aux}_*.deb
-                ${pkg_cache}/${aux}-*.deb
-            )
-            shopt -u nullglob
-            if [ "${#aux_matches[@]}" -eq 0 ]; then
-                if (cd "$pkg_cache" && apt-get download --quiet "$aux"); then
-                    :
-                else
-                    echo "  WARNING: unable to download ${aux}; installer browser may be incomplete."
-                fi
-            fi
-
-            shopt -s nullglob
-            aux_matches=(
-                ${pkg_cache}/${aux}_*.deb
-                ${pkg_cache}/${aux}-*.deb
-            )
-            shopt -u nullglob
-            for package_file in "${aux_matches[@]}"; do
-                selected["$package_file"]=1
-            done
+            [ -z "$aux" ] && continue
+            _try_download_pkg "$aux" || true
+            _record_matches "$aux"
         done
     fi
     : > "$selected_file"
