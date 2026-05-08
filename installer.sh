@@ -1999,6 +1999,30 @@ HOOK
         $bootloader_pkgs \
         2>&1 || die "Failed to install GRUB packages"
 
+    # Firmware packages on the installed system. Without this, kernels
+    # that drive modern AMD APUs (gfx_v11), Intel iGPUs, Realtek NICs,
+    # etc. fail at -EPROBE with "Direct firmware load ... failed with
+    # error -2" because /lib/firmware/ is empty — the display freezes,
+    # USB-Ethernet may not come up, and the operator has no way to tell
+    # what's wrong from the local console. Install firmware BEFORE the
+    # kernel package so the kernel postinst's update-initramfs picks
+    # up firmware blobs that early boot needs.
+    #
+    # non-free-firmware is enabled in the installed sources.list (see
+    # the apt-sources stage above). Projects that intentionally want
+    # only free firmware can set INSTALLER_FIRMWARE_PACKAGES="" or
+    # override with a different list.
+    local firmware_pkgs="${INSTALLER_FIRMWARE_PACKAGES-firmware-linux firmware-amd-graphics firmware-intel-graphics}"
+    if [ -n "$firmware_pkgs" ]; then
+        ui_status "Installing packages" "Installing firmware: ${firmware_pkgs}." 3 6
+        echo "  Installing firmware packages: ${firmware_pkgs}..."
+        # shellcheck disable=SC2086
+        DEBIAN_FRONTEND=noninteractive chroot "$TARGET" apt-get install -y -qq \
+            $firmware_pkgs \
+            2>/dev/null || \
+            echo "  WARNING: firmware install failed; the installed system may boot to a frozen display on AMD/Intel GPUs."
+    fi
+
     # Kernel packages. Projects that ship their own kernel set
     # INSTALLER_KERNEL_PACKAGES="" and install it from packages.sh.
     local kernel_pkgs="${INSTALLER_KERNEL_PACKAGES-linux-image-${ARCH} linux-headers-${ARCH}}"
