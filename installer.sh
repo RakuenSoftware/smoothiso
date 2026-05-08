@@ -2239,6 +2239,31 @@ devices {
 LVMCFG
     fi
 
+    # Slim down the initrd. Debian's default MODULES=most packs nearly
+    # every kernel module + firmware blob into the initrd, which with
+    # smoothkernel + zfs-initramfs balloons to several hundred MB.
+    # GRUB then has to load that whole thing through the firmware's
+    # block-I/O before jumping to the kernel — on physical hardware
+    # the screen sits on `Loading initial ramdisk ...` for minutes
+    # before any kernel output appears, indistinguishable from a
+    # hang.
+    #
+    # MODULES=dep tells initramfs-tools to bundle only the modules
+    # actually required to mount root — typically tens of MB.
+    # Trade-off: if the operator later swaps the storage controller
+    # for a different driver, the initrd won't have it; they have to
+    # boot a rescue ISO and rebuild. For a dedicated NAS appliance
+    # whose hardware is set at install time, that's the right
+    # default.
+    mkdir -p "$TARGET/etc/initramfs-tools/conf.d"
+    cat > "$TARGET/etc/initramfs-tools/conf.d/${PRODUCT_ID}-slim" << 'INITCFG'
+# smoothiso: ship only the modules needed to mount root. Cuts the
+# initrd from hundreds of MB (MODULES=most default) to tens of MB
+# so GRUB-side load time is bounded.
+MODULES=dep
+COMPRESS=zstd
+INITCFG
+
     # GRUB config.
     #
     # Default to a framebuffer-only console. The previous build hard-
