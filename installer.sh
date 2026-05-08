@@ -2240,15 +2240,33 @@ LVMCFG
     fi
 
     # GRUB config.
+    #
+    # Default to a framebuffer-only console. The previous build hard-
+    # coded `console=ttyS0,115200n8 console=tty0` plus a dual GRUB
+    # terminal, which on environments where serial is not drained at
+    # line rate (qemu sockets without a connected reader, USB-serial
+    # adapters with flow control, etc.) makes the kernel block on
+    # serial-output completion during initramfs init — the system
+    # appears frozen right after `Loading Linux …` for many minutes.
+    # Operators who genuinely need serial-console boot can opt in
+    # via the SMOOTHISO_SERIAL_CONSOLE install env var (or by adding
+    # `serial=1` to the installer kernel cmdline, see installer.sh
+    # main).
     cat >> "$TARGET/etc/default/grub" << 'GRUBCFG'
 
 # smoothiso: preload modules for mdraid + LVM root
 GRUB_PRELOAD_MODULES="part_gpt part_msdos mdraid1x lvm ext2"
 GRUB_DISABLE_OS_PROBER=true
+GRUBCFG
+
+    if [ "${SMOOTHISO_SERIAL_CONSOLE:-0}" = "1" ]; then
+        cat >> "$TARGET/etc/default/grub" << 'GRUBCFG'
+# smoothiso: serial console requested via SMOOTHISO_SERIAL_CONSOLE=1
 GRUB_TERMINAL="console serial"
 GRUB_SERIAL_COMMAND="serial --speed=115200"
-GRUB_CMDLINE_LINUX="console=ttyS0,115200n8 console=tty0"
+GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"
 GRUBCFG
+    fi
 
     # Rebuild initramfs.
     ui_status "Configuring system" "Rebuilding initramfs with LVM/RAID support." 4 6
