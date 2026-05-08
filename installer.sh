@@ -2397,9 +2397,6 @@ finish() {
     echo ""
     echo "   Username: admin"
     echo ""
-    echo "   Remove the installation media and"
-    echo "   press Enter to reboot."
-    echo ""
 
     if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
         ui_require_frontend
@@ -2407,10 +2404,18 @@ finish() {
             "Installation complete" \
             "Your ${PRODUCT_NAME} installation is finished. Remove installation media and press continue."
     else
-        run_whiptail \
-            --title "Installation complete" \
-            --msgbox "Your ${PRODUCT_NAME} installation is finished.\n\nRemove the installation media and press OK to reboot." \
-            12 60 || true
+        # Plain console countdown — whiptail --msgbox has been observed to
+        # hang on bare metal here (OK keypress not dismissing the dialog),
+        # leaving the system stuck on the completion screen instead of
+        # rebooting. The console echo below is reliable on every console
+        # type d-i exposes.
+        local secs=10
+        while [ "$secs" -gt 0 ]; do
+            printf '\r   Remove the installation media. Rebooting in %2d seconds...' "$secs"
+            sleep 1
+            secs=$((secs - 1))
+        done
+        printf '\n\n'
     fi
 
     echo "Rebooting..."
