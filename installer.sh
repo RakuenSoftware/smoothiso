@@ -2264,6 +2264,43 @@ MODULES=dep
 COMPRESS=zstd
 INITCFG
 
+    # Belt-and-suspenders: ensure the storage drivers, common file
+    # systems, and md/LVM stack are unconditionally bundled by name
+    # so a misdetected MODULES=dep run can't strand the system. These
+    # are tiny — adding them to /etc/initramfs-tools/modules adds
+    # them on top of whatever dep-mode finds.
+    cat > "$TARGET/etc/initramfs-tools/modules" << 'MODLIST'
+# smoothiso: explicit boot-essential modules. Belongs in initrd no
+# matter what dep-mode chooses, so the boot can find root even when
+# update-initramfs ran in an environment where lsmod misled it.
+virtio
+virtio_pci
+virtio_blk
+virtio_scsi
+virtio_net
+ahci
+nvme
+nvme_core
+sd_mod
+sr_mod
+xhci_pci
+xhci_hcd
+ehci_pci
+ehci_hcd
+ext4
+xfs
+btrfs
+dm_mod
+dm_mirror
+dm_snapshot
+dm_thin_pool
+raid0
+raid1
+raid10
+raid456
+md_mod
+MODLIST
+
     # GRUB config.
     #
     # Default to a framebuffer-only console. The previous build hard-
@@ -2277,11 +2314,21 @@ INITCFG
     # via the SMOOTHISO_SERIAL_CONSOLE install env var (or by adding
     # `serial=1` to the installer kernel cmdline, see installer.sh
     # main).
+    # Default boot is verbose. PR #27 dropped the hardcoded
+    # `console=ttyS0` from GRUB_CMDLINE_LINUX, but Debian's stock
+    # `GRUB_CMDLINE_LINUX_DEFAULT="quiet"` was still in effect — so
+    # after `Loading initial ramdisk ...` the kernel produced no
+    # console output, making any actual problem (slow boot, missing
+    # driver, kernel panic) indistinguishable from a hang. Override
+    # the default to empty so kernel boot messages stream to tty0
+    # and operators can see what's happening. Operators who prefer
+    # the silent splash can re-add `quiet` post-install.
     cat >> "$TARGET/etc/default/grub" << 'GRUBCFG'
 
 # smoothiso: preload modules for mdraid + LVM root
 GRUB_PRELOAD_MODULES="part_gpt part_msdos mdraid1x lvm ext2"
 GRUB_DISABLE_OS_PROBER=true
+GRUB_CMDLINE_LINUX_DEFAULT=""
 GRUBCFG
 
     if [ "${SMOOTHISO_SERIAL_CONSOLE:-0}" = "1" ]; then
@@ -2293,10 +2340,27 @@ GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"
 GRUBCFG
     fi
 
-    # Rebuild initramfs.
-    ui_status "Configuring system" "Rebuilding initramfs with LVM/RAID support." 4 6
-    echo "  Rebuilding initramfs..."
-    chroot "$TARGET" update-initramfs -u 2>&1 || true
+    # Rebuild initramfs for *every* installed kernel (-k all). Without
+    # -k, update-initramfs picks the kernel matching `uname -r`, which
+    # inside the d-i chroot is the d-i installer kernel — not
+    # smoothkernel. So `-u` alone may rebuild the wrong (or no)
+    # initrd, leaving smoothkernel's fat MODULES=most initrd from
+    # the kernel postinst untouched. -k all makes that
+    # impossible.
+    #
+    # The previous `|| true` swallowed failures silently and shipped
+    # broken installs. Keep the install going on failure (so the
+    # operator gets a usable rescue prompt rather than a wedged
+    # installer), but log the error visibly so the install log shows
+    # it.
+    ui_status "Configuring system" "Rebuilding initramfs for all installed kernels." 4 6
+    echo "  Rebuilding initramfs (all kernels)..."
+    if ! chroot "$TARGET" update-initramfs -u -k all 2>&1; then
+        echo "  WARNING: update-initramfs -u -k all failed. The installed system may not boot."
+        echo "  Recovery: boot a rescue ISO, chroot the target, run update-initramfs -u -k all."
+    fi
+    echo "  Resulting /boot contents:"
+    ls -lh "$TARGET/boot/"vmlinuz* "$TARGET/boot/"initrd* 2>&1 | sed 's/^/    /' || true
 
     # Base firewall: allow SSH + established. Project hook can add more.
     cat > "$TARGET/etc/nftables.conf" << 'NFT'
