@@ -1933,6 +1933,50 @@ HOOK
 # 6. Packages
 # ============================================================
 
+package_list_contains() {
+    local list="$1"
+    local want="$2"
+    local item
+    for item in $list; do
+        [ "$item" = "$want" ] && return 0
+    done
+    return 1
+}
+
+configure_bcachefs_repo() {
+    local filesystem_pkgs="${INSTALLER_FILESYSTEM_PACKAGES-btrfs-progs}"
+    local optional_filesystem_pkgs="${INSTALLER_OPTIONAL_FILESYSTEM_PACKAGES-bcachefs-tools}"
+    local combined_pkgs="${filesystem_pkgs} ${optional_filesystem_pkgs}"
+
+    if ! package_list_contains "$combined_pkgs" "bcachefs-tools" && \
+       ! package_list_contains "$combined_pkgs" "bcachefs-kernel-dkms"; then
+        return 0
+    fi
+
+    local repo_codename="${BCACHEFS_APT_CODENAME:-${DEBIAN_SUITE}}"
+    local repo_suite="${BCACHEFS_APT_SUITE:-bcachefs-tools-release}"
+    local key_path="/etc/apt/trusted.gpg.d/apt.bcachefs.org.asc"
+    local source_path="/etc/apt/sources.list.d/apt.bcachefs.org.sources"
+
+    ui_status "Installing packages" "Configuring bcachefs package repository." 3 6
+    echo "  Configuring bcachefs APT repository (${repo_codename}/${repo_suite})..."
+    mkdir -p "$TARGET/etc/apt/trusted.gpg.d" "$TARGET/etc/apt/sources.list.d"
+    if ! chroot "$TARGET" curl -fsSL -o "$key_path" \
+        https://apt.bcachefs.org/apt.bcachefs.org.asc; then
+        echo "  WARNING: bcachefs APT key download failed; bcachefs tooling may be unavailable."
+        return 0
+    fi
+    cat > "$TARGET$source_path" << SOURCES
+Types: deb
+URIs: https://apt.bcachefs.org/${repo_codename}/
+Suites: ${repo_suite}
+Components: main
+Signed-By: ${key_path}
+SOURCES
+    chroot "$TARGET" apt-get update -qq || \
+        echo "  WARNING: bcachefs APT repository update failed; bcachefs tooling may be unavailable."
+}
+
 install_packages() {
     msg "Installing packages"
 
@@ -2043,6 +2087,8 @@ HOOK
         sudo curl wget ca-certificates \
         systemd-timesyncd systemd-resolved \
         2>/dev/null || true
+
+    configure_bcachefs_repo
 
     # Filesystem array tooling for SmoothNAS-style managed arrays.
     # btrfs-progs is expected to be available in Debian and is installed
