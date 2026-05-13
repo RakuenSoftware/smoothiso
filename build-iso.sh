@@ -37,6 +37,8 @@
 #   INSTALLER_OPTIONAL_FILESYSTEM_PACKAGES  Filesystem tools attempted on the
 #       target without failing the install if unavailable. Default
 #       "bcachefs-tools".
+#   BCACHEFS_APT_CODENAME / BCACHEFS_APT_SUITE  Optional bcachefs APT repo
+#       selectors. Defaults to DEBIAN_SUITE / "bcachefs-tools-release".
 #   INSTALLER_KERNEL_DEB        Optional path to a linux-image .deb whose
 #       vmlinuz replaces the Debian netinst installer kernel. The deb's
 #       /lib/modules tree is also staged in the initrd so the running kernel
@@ -1105,6 +1107,8 @@ SMOOTHGUI_FRONTEND_BIND="${SMOOTHGUI_FRONTEND_BIND:-0.0.0.0}"
 INSTALLER_KERNEL_PACKAGES="${INSTALLER_KERNEL_PACKAGES-linux-image-${ARCH} linux-headers-${ARCH}}"
 INSTALLER_FILESYSTEM_PACKAGES="${INSTALLER_FILESYSTEM_PACKAGES-btrfs-progs}"
 INSTALLER_OPTIONAL_FILESYSTEM_PACKAGES="${INSTALLER_OPTIONAL_FILESYSTEM_PACKAGES-bcachefs-tools}"
+BCACHEFS_APT_CODENAME="${BCACHEFS_APT_CODENAME:-}"
+BCACHEFS_APT_SUITE="${BCACHEFS_APT_SUITE:-bcachefs-tools-release}"
 INSTALLER_BROWSER_DEFERRED="${INSTALLER_BROWSER_DEFERRED:-0}"
 INSTALLER_BROWSER_PKG="${INSTALLER_BROWSER_PKG:-firefox-esr}"
 INSTALLER_BROWSER_AUX_PKGS="${INSTALLER_BROWSER_AUX_PKGS:-xvfb xinit x11-utils x11-xserver-utils xserver-xorg-core xserver-xorg-input-libinput xserver-xorg-input-evdev xserver-xorg-video-fbdev xserver-xorg-video-vesa xserver-xorg-video-qxl xserver-xorg-video-all xserver-xorg-input-all xfonts-base xfonts-100dpi xfonts-75dpi libegl1 dbus dbus-x11 firmware-linux-free}"
