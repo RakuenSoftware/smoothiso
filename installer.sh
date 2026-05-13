@@ -2044,6 +2044,35 @@ HOOK
         systemd-timesyncd systemd-resolved \
         2>/dev/null || true
 
+    # Filesystem array tooling for SmoothNAS-style managed arrays.
+    # btrfs-progs is expected to be available in Debian and is installed
+    # as a normal target dependency. bcachefs support depends on both
+    # kernel and userspace availability, so its tools are attempted
+    # separately and treated as optional for images whose suite does not
+    # ship them yet.
+    local filesystem_pkgs="${INSTALLER_FILESYSTEM_PACKAGES-btrfs-progs}"
+    if [ -n "$filesystem_pkgs" ]; then
+        ui_status "Installing packages" "Installing filesystem tooling: ${filesystem_pkgs}." 3 6
+        echo "  Installing filesystem tooling: ${filesystem_pkgs}..."
+        # shellcheck disable=SC2086
+        DEBIAN_FRONTEND=noninteractive chroot "$TARGET" apt-get install -y -qq \
+            $filesystem_pkgs \
+            2>/dev/null || die "Failed to install filesystem tooling: ${filesystem_pkgs}"
+    fi
+
+    local optional_filesystem_pkgs="${INSTALLER_OPTIONAL_FILESYSTEM_PACKAGES-bcachefs-tools}"
+    if [ -n "$optional_filesystem_pkgs" ]; then
+        local optional_fs_pkg
+        for optional_fs_pkg in $optional_filesystem_pkgs; do
+            ui_status "Installing packages" "Attempting optional filesystem tooling: ${optional_fs_pkg}." 3 6
+            echo "  Attempting optional filesystem tooling: ${optional_fs_pkg}..."
+            DEBIAN_FRONTEND=noninteractive chroot "$TARGET" apt-get install -y -qq \
+                "$optional_fs_pkg" \
+                2>/dev/null || \
+                echo "  WARNING: optional filesystem tooling ${optional_fs_pkg} is unavailable in this image suite."
+        done
+    fi
+
     # Generate the CA trust bundle now so HTTPS works for tools (curl/wget)
     # used by project hooks. ca-certificates' postinst is stubbed by the
     # debconf pre-invoke hook, so /etc/ssl/certs/ca-certificates.crt would
