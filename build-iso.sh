@@ -477,14 +477,27 @@ download_iso() {
         echo "$cached"; return
     fi
     echo "Finding latest Debian ${DEBIAN_SUITE} netinst (${ARCH})..." >&2
-    local name
-    name=$(curl -sL "$DEBIAN_ISO_URL" \
-        | grep -oP "href=\"debian-[0-9.]+-${ARCH}-netinst\\.iso\"" \
-        | head -1 | tr -d '"' | sed 's/href=//')
-    [ -z "$name" ] && { echo "ERROR: Cannot find netinst ISO" >&2; exit 1; }
-    echo "Downloading $name..." >&2
-    curl -fSL -o "$cached" "${DEBIAN_ISO_URL}${name}"
-    echo "$cached"
+    local name listing attempt tmp
+    tmp="${cached}.tmp"
+    for attempt in 1 2 3; do
+        listing="$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$DEBIAN_ISO_URL" || true)"
+        name="$(printf '%s\n' "$listing" \
+            | sed -n "s/.*href=\"\\(debian-[^\"]*-${ARCH}-netinst\\.iso\\)\".*/\\1/p" \
+            | awk '!/^debian-(edu|mac)-/ { print; exit }')"
+        if [ -n "$name" ]; then
+            echo "Downloading $name..." >&2
+            rm -f "$tmp"
+            if curl -fSL --retry 5 --retry-all-errors --retry-delay 5 -o "$tmp" "${DEBIAN_ISO_URL}${name}"; then
+                mv "$tmp" "$cached"
+                echo "$cached"
+                return
+            fi
+        fi
+        [ "$attempt" -lt 3 ] && sleep "$((attempt * 10))"
+    done
+    rm -f "$tmp"
+    echo "ERROR: Cannot find netinst ISO" >&2
+    exit 1
 }
 
 # --- Extract only what we need from the ISO ---
