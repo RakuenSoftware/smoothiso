@@ -1475,6 +1475,18 @@ disk_stable_id() {
     return 0
 }
 
+disk_part() {
+    local disk="$1"
+    local number="$2"
+
+    # Linux block devices whose base name ends in a digit use a `p`
+    # separator before the partition number: nvme0n1p1, mmcblk0p1.
+    case "$disk" in
+        *[0-9]) printf '%sp%s\n' "$disk" "$number" ;;
+        *)      printf '%s%s\n' "$disk" "$number" ;;
+    esac
+}
+
 select_disks() {
     msg "Disk selection"
 
@@ -1681,7 +1693,7 @@ do_partitioning() {
         [ -b "$md" ] || continue
         mdadm --stop "$md" 2>/dev/null || true
     done
-    for dev in /dev/sd*[0-9] /dev/nvme*p[0-9]*; do
+    for dev in /dev/sd*[0-9] /dev/nvme*p[0-9]* /dev/mmcblk*p[0-9]*; do
         [ -b "$dev" ] || continue
         mdadm --zero-superblock "$dev" 2>/dev/null || true
     done
@@ -1710,12 +1722,10 @@ partition_single() {
     blockdev --rereadpt "$disk" 2>/dev/null || true
     sleep 1
 
-    local p1 p2 p3 p4
-    if echo "$disk" | grep -q "nvme"; then
-        p1="${disk}p1"; p2="${disk}p2"; p3="${disk}p3"; p4="${disk}p4"
-    else
-        p1="${disk}1"; p2="${disk}2"; p3="${disk}3"; p4="${disk}4"
-    fi
+    local p2 p3 p4
+    p2=$(disk_part "$disk" 2)
+    p3=$(disk_part "$disk" 3)
+    p4=$(disk_part "$disk" 4)
 
     mkfs.vfat -F 32 "$p2"
     mkfs.ext4 -F "$p3"
@@ -1774,11 +1784,8 @@ partition_raid() {
         sleep 1
 
         local p3 p4
-        if echo "$disk" | grep -q "nvme"; then
-            p3="${disk}p3"; p4="${disk}p4"
-        else
-            p3="${disk}3"; p4="${disk}4"
-        fi
+        p3=$(disk_part "$disk" 3)
+        p4=$(disk_part "$disk" 4)
 
         boot_parts="$boot_parts $p3"
         raid_parts="$raid_parts $p4"
@@ -1814,11 +1821,7 @@ EOF
 
     local first_disk=$(echo "$SELECTED_DISKS" | awk '{print $1}')
     local efi_part
-    if echo "$first_disk" | grep -q "nvme"; then
-        efi_part="${first_disk}p2"
-    else
-        efi_part="${first_disk}2"
-    fi
+    efi_part=$(disk_part "$first_disk" 2)
     mkfs.vfat -F 32 "$efi_part"
 
     ensure_lvm_nodes "${VG_NAME}" || \
@@ -2231,18 +2234,10 @@ HOSTS
         boot_dev="/dev/md0"
     else
         local disk=$(echo "$SELECTED_DISKS" | awk '{print $1}')
-        if echo "$disk" | grep -q "nvme"; then
-            boot_dev="${disk}p3"
-        else
-            boot_dev="${disk}3"
-        fi
+        boot_dev=$(disk_part "$disk" 3)
     fi
     local first_disk=$(echo "$SELECTED_DISKS" | awk '{print $1}')
-    if echo "$first_disk" | grep -q "nvme"; then
-        efi_dev="${first_disk}p2"
-    else
-        efi_dev="${first_disk}2"
-    fi
+    efi_dev=$(disk_part "$first_disk" 2)
 
     boot_uuid=$(blkid -s UUID -o value "$boot_dev" 2>/dev/null || true)
     efi_uuid=$(blkid -s UUID -o value "$efi_dev" 2>/dev/null || true)
@@ -2333,7 +2328,7 @@ NETCFG
         mkdir -p "$TARGET/etc/lvm/lvmlocal.conf.d"
         cat > "$TARGET/etc/lvm/lvmlocal.conf.d/${PRODUCT_ID}-raid.conf" << 'LVMCFG'
 devices {
-    global_filter = [ "a|/dev/md.*|", "r|/dev/sd.*|", "r|/dev/nvme.*|" ]
+    global_filter = [ "a|/dev/md.*|", "r|/dev/sd.*|", "r|/dev/nvme.*|", "r|/dev/mmcblk.*|" ]
 }
 LVMCFG
     fi
@@ -2380,6 +2375,10 @@ virtio_net
 ahci
 nvme
 nvme_core
+mmc_block
+mmc_core
+sdhci
+sdhci_pci
 sd_mod
 sr_mod
 xhci_pci
@@ -2552,7 +2551,7 @@ install_grub() {
             echo "  Installing GRUB (UEFI removable)..."
             chroot "$TARGET" grub-install --target="$efi_target" \
                 --efi-directory=/boot/efi \
-                --recheck --no-nvram --removable 2>&1 || \
+                --recheck --no-nvram --removable 2>&1 && uefi_ok=1 || \
                 echo "  WARNING: UEFI removable install failed"
         fi
     fi
@@ -2570,7 +2569,7 @@ install_grub() {
     fi
 
     [ "$uefi_ok" = "0" ] && [ "$bios_ok" = "0" ] && \
-        echo "  ERROR: No bootloader installed successfully!"
+        die "No bootloader installed successfully"
 
     ui_status "Installing bootloader" "Generating GRUB configuration." 5 6
     chroot "$TARGET" update-grub 2>&1 || echo "  WARNING: update-grub failed"
