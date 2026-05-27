@@ -2485,14 +2485,16 @@ NFT
 
     # Install firstboot script and systemd unit.
     if [ -f /smoothiso-firstboot ]; then
-        install -m 755 /smoothiso-firstboot \
+        cp /smoothiso-firstboot \
             "$TARGET/usr/local/bin/${PRODUCT_ID}-firstboot"
+        chmod 755 "$TARGET/usr/local/bin/${PRODUCT_ID}-firstboot"
 
         # Copy firstboot extension hook for use by the firstboot script.
         if [ -f /smoothiso-hooks/firstboot.sh ]; then
             mkdir -p "$TARGET/usr/local/lib/smoothiso"
-            install -m 755 /smoothiso-hooks/firstboot.sh \
+            cp /smoothiso-hooks/firstboot.sh \
                 "$TARGET/usr/local/lib/smoothiso/firstboot-ext.sh"
+            chmod 755 "$TARGET/usr/local/lib/smoothiso/firstboot-ext.sh"
         fi
 
         cat > "$TARGET/etc/systemd/system/${PRODUCT_ID}-firstboot.service" << UNIT
