@@ -1490,6 +1490,26 @@ disk_part() {
 select_disks() {
     msg "Disk selection"
 
+    # Pre-set bypass: if SELECTED_DISKS is already exported (from config.sh,
+    # kernel cmdline, or an outer automation wrapper), validate the devices
+    # exist and skip the interactive picker. This is what lets CI / unattended
+    # installs run without operator input.
+    if [ -n "${SELECTED_DISKS:-}" ]; then
+        echo "  Using pre-configured SELECTED_DISKS: $SELECTED_DISKS"
+        for d in $SELECTED_DISKS; do
+            [ -b "$d" ] || die "Pre-configured disk is not a block device: $d"
+        done
+        SELECTED_COUNT=$(echo "$SELECTED_DISKS" | wc -w)
+        if [ "$SELECTED_COUNT" -gt 1 ]; then
+            USE_RAID=1
+            echo "  Mode: RAID-1 + LVM"
+        else
+            USE_RAID=0
+            echo "  Mode: Single disk + LVM"
+        fi
+        return 0
+    fi
+
     # Build a tab-separated table (size, /dev/name, label, description)
     # so we can sort by size before rendering JSON. Tab is safe — none of
     # the fields ever contain it.
@@ -1600,6 +1620,18 @@ select_disks() {
 
 prompt_password() {
     msg "Set admin password"
+
+    # Pre-set bypass: same automation hook as SELECTED_DISKS. The pre-set
+    # value still has to meet the 6-character minimum the interactive
+    # prompt enforces, otherwise the install completes with a password
+    # the installed system's PAM will reject.
+    if [ -n "${ADMIN_PASSWORD:-}" ]; then
+        if [ ${#ADMIN_PASSWORD} -lt 6 ]; then
+            die "Pre-configured ADMIN_PASSWORD must be at least 6 characters"
+        fi
+        echo "  Using pre-configured ADMIN_PASSWORD."
+        return 0
+    fi
 
     ADMIN_PASSWORD=""
 
@@ -2533,6 +2565,8 @@ install_grub() {
     msg "Installing GRUB bootloader"
 
     local uefi_ok=0 bios_ok=0 efi_pkg efi_target
+    local grub_log="${TMPDIR:-/tmp}/grub-install.log"
+    : > "$grub_log"
 
     case "$ARCH" in
         amd64) efi_pkg="grub-efi-amd64" ; efi_target="x86_64-efi" ;;
@@ -2544,17 +2578,23 @@ install_grub() {
         if chroot "$TARGET" dpkg -l "$efi_pkg" 2>/dev/null | grep -q '^ii'; then
             ui_status "Installing bootloader" "Installing GRUB for UEFI." 5 6
             echo "  Installing GRUB (UEFI)..."
-            chroot "$TARGET" grub-install --target="$efi_target" \
-                --efi-directory=/boot/efi \
-                --bootloader-id="${PRODUCT_ID}" \
-                --recheck --no-nvram 2>&1 && uefi_ok=1 || \
-                echo "  WARNING: UEFI GRUB install failed"
+            if chroot "$TARGET" grub-install --target="$efi_target" \
+                    --efi-directory=/boot/efi \
+                    --bootloader-id="${PRODUCT_ID}" \
+                    --recheck --no-nvram >>"$grub_log" 2>&1; then
+                uefi_ok=1
+            else
+                echo "  WARNING: UEFI GRUB install failed (see ${grub_log})"
+            fi
             ui_status "Installing bootloader" "Installing GRUB (UEFI removable fallback)." 5 6
             echo "  Installing GRUB (UEFI removable)..."
-            chroot "$TARGET" grub-install --target="$efi_target" \
-                --efi-directory=/boot/efi \
-                --recheck --no-nvram --removable 2>&1 && uefi_ok=1 || \
-                echo "  WARNING: UEFI removable install failed"
+            if chroot "$TARGET" grub-install --target="$efi_target" \
+                    --efi-directory=/boot/efi \
+                    --recheck --no-nvram --removable >>"$grub_log" 2>&1; then
+                uefi_ok=1
+            else
+                echo "  WARNING: UEFI removable install failed (see ${grub_log})"
+            fi
         fi
     fi
 
@@ -2564,17 +2604,43 @@ install_grub() {
         for disk in $SELECTED_DISKS; do
             ui_status "Installing bootloader" "Installing GRUB (BIOS) to ${disk}." 5 6
             echo "  Installing GRUB (BIOS) to $disk..."
-            chroot "$TARGET" grub-install --target=i386-pc "$disk" 2>&1 \
-                && bios_ok=1 || \
-                echo "  WARNING: BIOS GRUB install to $disk failed"
+            if chroot "$TARGET" grub-install --target=i386-pc "$disk" \
+                    >>"$grub_log" 2>&1; then
+                bios_ok=1
+            else
+                echo "  WARNING: BIOS GRUB install to $disk failed (see ${grub_log})"
+            fi
+            # grub-install can return 0 on a partial run if grub-bios-setup
+            # fails to embed core.img — the MBR boot sector ends up zeroed
+            # and the system silently won't boot. Verify by reading back the
+            # first 446 bytes (the bootcode area, before the partition table)
+            # and treating an all-zero region as a failed install.
+            if [ "$bios_ok" = "1" ]; then
+                if dd if="$disk" bs=446 count=1 2>/dev/null \
+                       | tr -d '\000' | LC_ALL=C grep -q '[^[:space:]]'; then
+                    echo "  Verified MBR boot sector on $disk."
+                else
+                    bios_ok=0
+                    echo "  WARNING: BIOS GRUB exited 0 but MBR on $disk is empty (see ${grub_log})"
+                fi
+            fi
         done
     fi
 
-    [ "$uefi_ok" = "0" ] && [ "$bios_ok" = "0" ] && \
+    if [ "$uefi_ok" = "0" ] && [ "$bios_ok" = "0" ]; then
+        if [ -s "$grub_log" ]; then
+            echo "  --- grub-install log ---"
+            tail -n 40 "$grub_log"
+            echo "  --- end log ---"
+        fi
         die "No bootloader installed successfully"
+    fi
 
     ui_status "Installing bootloader" "Generating GRUB configuration." 5 6
-    chroot "$TARGET" update-grub 2>&1 || echo "  WARNING: update-grub failed"
+    if ! chroot "$TARGET" update-grub >>"$grub_log" 2>&1; then
+        tail -n 40 "$grub_log"
+        die "update-grub failed (see ${grub_log})"
+    fi
     echo "  GRUB installed."
 }
 
