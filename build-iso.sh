@@ -378,12 +378,12 @@ install_gpu_firmware() {
             if [ -n "$pool_path" ]; then
                 local pool_url="${DEBIAN_MIRROR:-http://deb.debian.org/debian}/pool/${pool_path}/"
                 local deb_name
-                deb_name=$(curl -sL "$pool_url" \
+                deb_name=$(curl -sL --retry 5 --retry-all-errors --retry-delay 5 "$pool_url" \
                     | grep -oP "href=\"${pkg}_[^\"]*_all\\.deb\"" \
                     | tail -1 | tr -d '"' | sed 's/href=//')
                 if [ -n "$deb_name" ]; then
                     echo "    Fetching ${deb_name} from Debian mirror..."
-                    curl -fsSL -o "${fw_cache}/${deb_name}" "${pool_url}${deb_name}" || true
+                    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "${fw_cache}/${deb_name}" "${pool_url}${deb_name}" || true
                 fi
                 shopt -s nullglob
                 matches=("${fw_cache}/${pkg}_"*.deb "${fw_cache}/${pkg}-"*.deb)
@@ -656,7 +656,7 @@ find_installer_linux_image_deb() {
 
     local packages_url="${DEBIAN_MIRROR%/}/dists/${DEBIAN_SUITE}/main/binary-${ARCH}/Packages.gz"
     local filename=""
-    filename=$(curl -fsSL "$packages_url" | gzip -dc | awk -v pkg="$pkg" '
+    filename=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$packages_url" | gzip -dc | awk -v pkg="$pkg" '
         BEGIN { RS = ""; FS = "\n" }
         {
             if (printed) {
@@ -677,7 +677,7 @@ find_installer_linux_image_deb() {
     if [ -n "$filename" ]; then
         deb="${kernel_cache}/$(basename "$filename")"
         if [ ! -f "$deb" ]; then
-            curl -fsSL -o "$deb" "${DEBIAN_MIRROR%/}/${filename}" || true
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$deb" "${DEBIAN_MIRROR%/}/${filename}" || true
         fi
         if [ -f "$deb" ]; then
             printf '%s\n' "$deb"
@@ -1027,11 +1027,11 @@ setup_initrd() {
         echo "  Downloading gdisk..."
         local gdisk_url="http://deb.debian.org/debian/pool/main/g/gdisk/"
         local gdisk_name
-        gdisk_name=$(curl -sL "$gdisk_url" \
+        gdisk_name=$(curl -sL --retry 5 --retry-all-errors --retry-delay 5 "$gdisk_url" \
             | grep -oP "href=\"gdisk_[^\"]*_${ARCH}\\.deb\"" \
             | tail -1 | tr -d '"' | sed 's/href=//')
         if [ -n "$gdisk_name" ]; then
-            curl -fsSL -o "$gdisk_deb" "${gdisk_url}${gdisk_name}"
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$gdisk_deb" "${gdisk_url}${gdisk_name}"
         fi
     fi
     [ -f "$gdisk_deb" ] && extract_bins "$gdisk_deb" sgdisk || \
@@ -1069,7 +1069,7 @@ setup_initrd() {
     # Compile pkgdetails (required by debootstrap).
     echo "  Building pkgdetails..."
     local pkgdetails_src="/tmp/pkgdetails.c"
-    curl -fsSL \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
         "https://salsa.debian.org/installer-team/base-installer/-/raw/master/pkgdetails.c" \
         -o "$pkgdetails_src"
     mkdir -p "${tmp}/usr/lib/debootstrap"
