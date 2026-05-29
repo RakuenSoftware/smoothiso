@@ -19,6 +19,8 @@
 #   DEBIAN_MIRROR       Debian mirror, default "http://deb.debian.org/debian"
 #   BOOT_MENU_TITLE     Boot menu label, default "${PRODUCT_NAME} Install"
 #   ISO_LABEL           ISO volume label, default upper-cased PRODUCT_ID
+#   AUTO_INSTALL_DISK       Disk for the unattended boot entry, default /dev/sda
+#   AUTO_INSTALL_PASSWORD   Admin password for the unattended entry, default "changeme"
 #   SMOOTHGUI_FRONTEND_DIR      Installer frontend bundle directory
 #   SMOOTHGUI_FRONTEND_REQUIRED  Set to 1 to require SmoothGUI at runtime (default: 1)
 #   SMOOTHGUI_FRONTEND_PORT      Frontend bind port (default: 8080)
@@ -85,6 +87,12 @@ ARCH="${ARCH:-amd64}"
 DEBIAN_MIRROR="${DEBIAN_MIRROR:-http://deb.debian.org/debian}"
 BOOT_MENU_TITLE="${BOOT_MENU_TITLE:-${PRODUCT_NAME} Install}"
 ISO_LABEL="${ISO_LABEL:-$(echo "$PRODUCT_ID" | tr '[:lower:]' '[:upper:]')}"
+# Defaults for the unattended "Automated Install" boot entry. installer.sh
+# parses these from the kernel cmdline (smoothiso.disks / smoothiso.password)
+# and feeds them to its existing SELECTED_DISKS / ADMIN_PASSWORD bypass. The
+# entry is never the default boot target, so interactive install is unaffected.
+AUTO_INSTALL_DISK="${AUTO_INSTALL_DISK:-/dev/sda}"
+AUTO_INSTALL_PASSWORD="${AUTO_INSTALL_PASSWORD:-changeme}"
 INSTALLER_KERNEL_DEB="${INSTALLER_KERNEL_DEB:-}"
 SMOOTHGUI_FRONTEND_DIR="${SMOOTHGUI_FRONTEND_DIR:-}"
 SMOOTHGUI_FRONTEND_REQUIRED="${SMOOTHGUI_FRONTEND_REQUIRED:-1}"
@@ -1215,6 +1223,11 @@ LABEL ${PRODUCT_ID}
     kernel /install.${ARCH}/vmlinuz
     append auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 initrd=/install.${ARCH}/initrd.gz ---
 
+LABEL ${PRODUCT_ID}-auto
+    MENU LABEL ${BOOT_MENU_TITLE} (Automated — wipes the first disk)
+    kernel /install.${ARCH}/vmlinuz
+    append auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 smoothiso.disks=${AUTO_INSTALL_DISK} smoothiso.password=${AUTO_INSTALL_PASSWORD} initrd=/install.${ARCH}/initrd.gz ---
+
 LABEL bootlocal
     MENU LABEL Boot from first hard disk
     localboot 0x80
@@ -1228,6 +1241,11 @@ set timeout_style=menu
 
 menuentry "${BOOT_MENU_TITLE}" {
     linux /install.${ARCH}/vmlinuz auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 ---
+    initrd /install.${ARCH}/initrd.gz
+}
+
+menuentry "${BOOT_MENU_TITLE} (Automated — wipes the first disk)" {
+    linux /install.${ARCH}/vmlinuz auto=true priority=critical file=/preseed.cfg DEBCONF_DEBUG=5 console=ttyS0,115200n8 console=tty0 smoothiso.disks=${AUTO_INSTALL_DISK} smoothiso.password=${AUTO_INSTALL_PASSWORD} ---
     initrd /install.${ARCH}/initrd.gz
 }
 

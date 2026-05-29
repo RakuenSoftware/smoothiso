@@ -26,6 +26,43 @@ if [ -f /smoothiso-hooks/config.sh ]; then
     . /smoothiso-hooks/config.sh
 fi
 
+# Parse unattended-install answers from the kernel command line. This lets the
+# whole install run without operator input: the values are exported into the
+# same SELECTED_DISKS / ADMIN_PASSWORD variables the interactive prompts already
+# honor as a pre-set bypass (see select_disks / prompt_password).
+#
+# Recognised kernel cmdline keys (all optional):
+#   smoothiso.disks=/dev/sda            one or more block devices (comma or
+#                                       plus separated for RAID-1, e.g.
+#                                       smoothiso.disks=/dev/sda+/dev/sdb)
+#   smoothiso.password=hunter2          admin/root password (>= 6 chars)
+#   smoothiso.auto                      marker only; install is unattended
+#                                       whenever disks+password are supplied,
+#                                       this just documents intent on the menu
+#
+# Interactive install is unaffected: with none of these present, the prompts
+# run exactly as before.
+parse_cmdline_automation() {
+    [ -r /proc/cmdline ] || return 0
+    local tok key val
+    for tok in $(cat /proc/cmdline); do
+        case "$tok" in
+            smoothiso.disks=*)
+                val="${tok#smoothiso.disks=}"
+                # Accept comma or plus as separators; installer wants spaces.
+                val=$(printf '%s' "$val" | tr ',+' '  ')
+                [ -n "$val" ] && SELECTED_DISKS="$val"
+                ;;
+            smoothiso.password=*)
+                ADMIN_PASSWORD="${tok#smoothiso.password=}"
+                ;;
+        esac
+    done
+    [ -n "${SELECTED_DISKS:-}" ] && export SELECTED_DISKS
+    [ -n "${ADMIN_PASSWORD:-}" ] && export ADMIN_PASSWORD
+}
+parse_cmdline_automation
+
 TARGET="/mnt/target"
 PRODUCT_NAME="${PRODUCT_NAME:-Linux}"
 PRODUCT_ID="${PRODUCT_ID:-linux}"
