@@ -57,6 +57,12 @@
 #       apt-get download on the build host; requires the relevant repos to be
 #       configured. Useful for staging GPU firmware without linux-firmware.
 #       Example: "firmware-amd-graphics"
+#   INSTALLER_GPU_FIRMWARE_SUBDIRS  Optional space-separated list of subdirs
+#       under /lib/firmware to stage from INSTALLER_GPU_FIRMWARE_PKGS instead
+#       of the whole package tree. Keeps the initrd small when a package
+#       bundles far more firmware than the GPU needs (e.g. staging only "i915"
+#       from firmware-intel-graphics, which also ships intel/ and xe/ blobs).
+#       Example: "i915"
 #   INSTALLER_GPU_KERNEL_MODULES  Space-separated list of installer-kernel GPU
 #       module names to stage from the full linux-image package matching the
 #       Debian installer kernel. Dependencies and modules.* metadata are
@@ -341,7 +347,10 @@ install_gpu_firmware() {
     # (e.g. non-free-firmware on Ubuntu CI runners).
     # Keyed by binary package name, value is pool/component/src-prefix.
     local _amd_pool="non-free-firmware/f/firmware-nonfree"
-    local _intel_pool="non-free-firmware/i/intel-microcode"
+    # Intel GPU firmware (firmware-intel-graphics: i915 DMC/GuC/HuC) is built
+    # from src:firmware-nonfree — NOT intel-microcode (that is CPU microcode
+    # and contains no i915/ blobs).
+    local _intel_pool="non-free-firmware/f/firmware-nonfree"
     local _realtek_pool="non-free-firmware/f/firmware-nonfree"
 
     _fw_pool_path() {
@@ -405,8 +414,20 @@ install_gpu_firmware() {
             for firmware_dir in "$fw_tmp/lib/firmware" "$fw_tmp/usr/lib/firmware"; do
                 [ -d "$firmware_dir" ] || continue
                 mkdir -p "${initrd_tmp}/lib/firmware"
-                cp -a --no-clobber "$firmware_dir/." "${initrd_tmp}/lib/firmware/"
-                staged=1
+                if [ -n "${INSTALLER_GPU_FIRMWARE_SUBDIRS:-}" ]; then
+                    # Stage only the requested subdirs (e.g. "i915") so a broad
+                    # package does not bloat the initrd.
+                    local _sd
+                    for _sd in $INSTALLER_GPU_FIRMWARE_SUBDIRS; do
+                        [ -e "$firmware_dir/$_sd" ] || continue
+                        mkdir -p "${initrd_tmp}/lib/firmware/$(dirname "$_sd")"
+                        cp -a --no-clobber "$firmware_dir/$_sd" "${initrd_tmp}/lib/firmware/$_sd"
+                        staged=1
+                    done
+                else
+                    cp -a --no-clobber "$firmware_dir/." "${initrd_tmp}/lib/firmware/"
+                    staged=1
+                fi
             done
             if [ "$staged" = "1" ]; then
                 echo "    Staged firmware from $(basename "$deb")."
