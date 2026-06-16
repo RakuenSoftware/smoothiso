@@ -2783,15 +2783,26 @@ install_grub() {
 finish() {
     msg "Installation complete"
 
-    # Flush all install writes to disk before unmounting and the hard reboot.
-    # The package phase runs dpkg with force-unsafe-io (no per-file fsync), so a
-    # large backlog of dirty pages can remain at this point. The umounts below
-    # use `|| true` and can fail if $TARGET is still busy, and the final
-    # `reboot -f` is a hard reset — so without an explicit sync here the most
-    # recently written files (e.g. /etc/systemd/network/90-dhcp-fallback.network,
-    # the DHCP catch-all, written late in configure_system) can be lost, landing
-    # as 0-byte files on the installed system. That leaves the WAN interface
-    # unmanaged by systemd-networkd, so the appliance boots with no DHCP / no WAN.
+    # Durably commit every install write before the hard reboot. The package
+    # phase runs dpkg with force-unsafe-io (no per-file fsync), and grub-install
+    # writes the EFI bootloader onto the FAT ESP late in install_grub; the final
+    # `reboot -f` is a hard reset. A bare `sync` has proven insufficient: the
+    # umounts below use `|| true` and routinely fail because $TARGET is still
+    # busy, so the filesystems are never cleanly closed, and the hard reset can
+    # pre-empt writeback — losing the most recently written data. On the
+    # journal-less vfat ESP this drops the GRUB *.efi files entirely, leaving an
+    # unbootable "no boot device" system; on ext4 it can truncate late files
+    # such as /etc/systemd/network/90-dhcp-fallback.network (no DHCP / no WAN).
+    #
+    # Remounting each target filesystem read-only forces a full, synchronous
+    # flush to a clean on-disk state and — unlike umount — succeeds even while
+    # the mount is busy, so it is a reliable durability barrier regardless of
+    # what still holds $TARGET open. Deepest mount first.
+    cd / 2>/dev/null || true
+    sync
+    for _romnt in "$TARGET/boot/efi" "$TARGET/boot" "$TARGET"; do
+        mount -o remount,ro "$_romnt" 2>/dev/null || true
+    done
     sync
 
     umount "$TARGET/dev/pts" 2>/dev/null || true
