@@ -1279,11 +1279,61 @@ EOF
 
 # --- Repack ISO ---
 
+# build_offline_pool stages the Debian base-system .debs onto the ISO so the
+# installer can debootstrap from a local cache instead of pulling every base
+# package over the network — the dominant cost of an install. It is opt-in
+# (SMOOTHISO_OFFLINE=1) and best-effort: if anything here fails the pool is
+# simply absent and the installer downloads as before. The packages are placed
+# in $WORK_DIR/offline/base-cache and consumed at install time via
+# `debootstrap --cache-dir`, which falls back to the network per package, so a
+# stale or partial cache can never break an install.
+build_offline_pool() {
+    [ "${SMOOTHISO_OFFLINE:-0}" = "1" ] || return 0
+    echo "Building offline package pool..."
+
+    if ! command -v debootstrap >/dev/null 2>&1; then
+        echo "  WARNING: debootstrap not on build host; skipping offline base cache."
+        return 0
+    fi
+
+    local off="${WORK_DIR}/offline"
+    local base_cache="${off}/base-cache"
+    mkdir -p "$base_cache"
+
+    # --download-only fetches the base .debs without unpacking a chroot, so it
+    # does not require root. Point its cache at base_cache; some debootstrap
+    # versions stage debs under <target>/var/cache/apt/archives instead, so we
+    # sweep both into base_cache afterwards.
+    local dbtmp
+    dbtmp=$(mktemp -d)
+    echo "  Downloading ${DEBIAN_SUITE}/${ARCH} base system..."
+    if debootstrap --download-only --arch="$ARCH" \
+            --cache-dir="$base_cache" \
+            "$DEBIAN_SUITE" "$dbtmp" "$DEBIAN_MIRROR" >/dev/null 2>&1; then
+        find "$dbtmp" -name '*.deb' -exec cp -n {} "$base_cache/" \; 2>/dev/null || true
+        local n
+        n=$(find "$base_cache" -name '*.deb' | wc -l)
+        if [ "$n" -gt 0 ]; then
+            echo "  Offline base cache: ${n} packages ($(du -sh "$base_cache" 2>/dev/null | cut -f1))."
+        else
+            echo "  WARNING: base cache empty; installer will download the base over the network."
+            rm -rf "$off"
+        fi
+    else
+        echo "  WARNING: base download failed; installer will download the base over the network."
+        rm -rf "$off"
+    fi
+    rm -rf "$dbtmp"
+}
+
 repack_iso() {
     echo "Repacking ISO..."
     mkdir -p "$(dirname "$ISO_OUTPUT_FILE")"
 
+    # Exclude the offline pool from the media checksum manifest: it can be
+    # hundreds of MB (slow to hash) and is verified per-package by debootstrap.
     (cd "$WORK_DIR" && find . -type f ! -name md5sum.txt ! -path './isolinux/*' \
+        ! -path './offline/*' \
         -exec md5sum {} \; 2>/dev/null) > "${WORK_DIR}/md5sum.txt"
 
     # ISO 9660 caps the volume label at 32 chars; xorriso aborts with
@@ -1344,6 +1394,7 @@ main() {
     replace_installer_kernel
     setup_initrd
     setup_boot
+    build_offline_pool
     repack_iso
 
     [ -n "$_INSTALLER_KERNEL_MODULES_STAGE" ] && rm -rf "$_INSTALLER_KERNEL_MODULES_STAGE"

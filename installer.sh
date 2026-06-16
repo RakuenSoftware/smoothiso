@@ -1935,15 +1935,70 @@ EOF
 # 5. Base system
 # ============================================================
 
+# OFFLINE_DIR is set by mount_offline_pool() to the path of the on-ISO package
+# pool (…/offline) when one is present, or left empty.
+OFFLINE_DIR=""
+
+# mount_offline_pool locates and mounts the installation ISO (read-only) and, if
+# it carries an offline package pool, points OFFLINE_DIR at it. Best-effort:
+# any failure just leaves OFFLINE_DIR empty and the install proceeds online.
+mount_offline_pool() {
+    [ -n "$OFFLINE_DIR" ] && return 0
+    # d-i may already have the media mounted; check the usual spots first.
+    local cand
+    for cand in /cdrom /run/smoothiso-cdrom /media/cdrom /media/cdrom0 /run/live/medium; do
+        [ -d "$cand/offline/base-cache" ] && {
+            OFFLINE_DIR="$cand/offline"
+            echo "  Offline package pool found: $OFFLINE_DIR"
+            return 0
+        }
+    done
+    # The installer normally never touches the boot medium (it runs from the
+    # initrd), so the optical driver may not be loaded yet — pull it in, then
+    # mount whatever block device carries the iso9660 filesystem.
+    modprobe sr_mod 2>/dev/null || true
+    modprobe cdrom 2>/dev/null || true
+    modprobe isofs 2>/dev/null || true
+    udevadm settle 2>/dev/null || true
+    local mnt=/run/smoothiso-cdrom dev
+    mkdir -p "$mnt"
+    for dev in $(blkid -t TYPE=iso9660 -o device 2>/dev/null) \
+               /dev/sr0 /dev/sr1 /dev/cdrom $(ls /dev/sr* 2>/dev/null); do
+        [ -b "$dev" ] || continue
+        mount -o ro "$dev" "$mnt" 2>/dev/null || continue
+        if [ -d "$mnt/offline/base-cache" ]; then
+            OFFLINE_DIR="$mnt/offline"
+            echo "  Offline package pool found: $OFFLINE_DIR (mounted $dev)"
+            return 0
+        fi
+        umount "$mnt" 2>/dev/null || true
+    done
+    echo "  No offline package pool on the install medium; downloading base over the network."
+    return 0
+}
+
 install_base() {
     msg "Installing base system (this may take several minutes)"
 
     command -v debootstrap >/dev/null 2>&1 || \
         die "debootstrap not found in initrd -- rebuild ISO"
 
-    ui_status "Installing base system" "Running debootstrap first stage (downloading Debian ${DEBIAN_SUITE}). This takes a few minutes." 2 6
+    # Use the on-ISO base cache when available. debootstrap --cache-dir uses a
+    # cached .deb only when it matches the mirror's current version and fetches
+    # the rest over the network, so this is a pure speedup with per-package
+    # network fallback. Guarded on the flag being supported by this debootstrap.
+    local cache_args=""
+    mount_offline_pool
+    if [ -n "$OFFLINE_DIR" ] && [ -d "$OFFLINE_DIR/base-cache" ] && \
+       debootstrap --help 2>&1 | grep -q -- '--cache-dir'; then
+        cache_args="--cache-dir=$OFFLINE_DIR/base-cache"
+        echo "  Using offline base cache ($(find "$OFFLINE_DIR/base-cache" -name '*.deb' | wc -l) packages)."
+    fi
+
+    ui_status "Installing base system" "Running debootstrap first stage (Debian ${DEBIAN_SUITE}). This takes a few minutes." 2 6
     echo "  Running debootstrap for ${DEBIAN_SUITE}..."
-    debootstrap --foreign --arch="$ARCH" \
+    # shellcheck disable=SC2086
+    debootstrap --foreign --arch="$ARCH" $cache_args \
         "$DEBIAN_SUITE" "$TARGET" "$DEBIAN_MIRROR" || \
         die "debootstrap first stage failed"
 
