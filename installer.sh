@@ -1173,10 +1173,30 @@ setup_network() {
     for dev in /sys/class/net/*; do
         local name=$(basename "$dev")
         [ "$name" = "lo" ] && continue
+        # Only consider real NICs. The installer ramdisk loads modules that
+        # create virtual interfaces (dummy0, ifb0/ifb1, eql, ...); none of them
+        # can ever get a DHCP lease, but the discovery loop below was spending a
+        # full ~18s DHCP timeout on each, adding over a minute to every install.
+        # Physical interfaces have a /sys/class/net/<name>/device link to their
+        # backing PCI/USB device; virtual ones do not.
+        [ -e "$dev/device" ] || continue
         ifaces="$ifaces $name"
         iface_count=$((iface_count + 1))
     done
     ifaces=$(echo "$ifaces" | sed 's/^ //')
+
+    # Fall back to all non-loopback interfaces if the device-link filter found
+    # nothing (some exotic NIC drivers don't expose the link) so we never strand
+    # an install with no network to probe.
+    if [ -z "$ifaces" ]; then
+        for dev in /sys/class/net/*; do
+            local name=$(basename "$dev")
+            [ "$name" = "lo" ] && continue
+            ifaces="$ifaces $name"
+            iface_count=$((iface_count + 1))
+        done
+        ifaces=$(echo "$ifaces" | sed 's/^ //')
+    fi
 
     [ -z "$ifaces" ] && die "No network interface found"
 
@@ -1932,6 +1952,13 @@ install_base() {
     mkdir -p "$TARGET/etc/dpkg/dpkg.cfg.d"
     cat > "$TARGET/etc/dpkg/dpkg.cfg.d/smoothiso-bootstrap" << 'DPKGCFG'
 pre-invoke=/debootstrap/stub-debconf-postinsts
+# Skip the per-file fsync()/sync() dpkg normally does after unpacking each
+# package. The target filesystem was just created and the machine reboots at
+# the end of the install, so durability mid-install buys nothing; this is the
+# same trade-off the stock Debian installer makes and removes a large amount of
+# I/O stall from the base-system configure phase. Removed with this file before
+# the install completes, so the running system keeps dpkg's safe default.
+force-unsafe-io
 DPKGCFG
     cat > "$TARGET/debootstrap/stub-debconf-postinsts" << 'HOOK'
 #!/bin/sh
@@ -2080,7 +2107,19 @@ POLICY
     mkdir -p "$TARGET/etc/dpkg/dpkg.cfg.d"
     cat > "$TARGET/etc/dpkg/dpkg.cfg.d/smoothiso-install" << 'DPKGCFG'
 pre-invoke=/tmp/smoothiso-stub-debconf
+# See install_base(): skip dpkg's per-file fsync during the package-install
+# phase too. Removed at the end of install_packages so it never reaches the
+# running system.
+force-unsafe-io
 DPKGCFG
+    # Don't download translated package descriptions (one index per configured
+    # language for every apt source) — they are never used by the unattended
+    # install and just add round-trips. Removed with policy-rc.d at the end.
+    mkdir -p "$TARGET/etc/apt/apt.conf.d"
+    cat > "$TARGET/etc/apt/apt.conf.d/99smoothiso-install-speed" << 'APTCFG'
+Acquire::Languages "none";
+Acquire::http::Pipeline-Depth "10";
+APTCFG
     cat > "$TARGET/tmp/smoothiso-stub-debconf" << 'HOOK'
 #!/bin/sh
 for f in /var/lib/dpkg/info/*.postinst; do
@@ -2220,6 +2259,7 @@ HOOK
 
     # Cleanup hooks and stubs.
     rm -f "$TARGET/etc/dpkg/dpkg.cfg.d/smoothiso-install"
+    rm -f "$TARGET/etc/apt/apt.conf.d/99smoothiso-install-speed"
     rm -f "$TARGET/tmp/smoothiso-stub-debconf"
     if [ -f "$TARGET/usr/sbin/dpkg-preconfigure.real" ]; then
         mv "$TARGET/usr/sbin/dpkg-preconfigure.real" \
