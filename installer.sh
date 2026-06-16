@@ -2783,6 +2783,17 @@ install_grub() {
 finish() {
     msg "Installation complete"
 
+    # Flush all install writes to disk before unmounting and the hard reboot.
+    # The package phase runs dpkg with force-unsafe-io (no per-file fsync), so a
+    # large backlog of dirty pages can remain at this point. The umounts below
+    # use `|| true` and can fail if $TARGET is still busy, and the final
+    # `reboot -f` is a hard reset — so without an explicit sync here the most
+    # recently written files (e.g. /etc/systemd/network/90-dhcp-fallback.network,
+    # the DHCP catch-all, written late in configure_system) can be lost, landing
+    # as 0-byte files on the installed system. That leaves the WAN interface
+    # unmanaged by systemd-networkd, so the appliance boots with no DHCP / no WAN.
+    sync
+
     umount "$TARGET/dev/pts" 2>/dev/null || true
     umount "$TARGET/dev"     2>/dev/null || true
     umount "$TARGET/proc"    2>/dev/null || true
