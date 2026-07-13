@@ -60,7 +60,13 @@ parse_cmdline_automation() {
     done
     [ -n "${SELECTED_DISKS:-}" ] && export SELECTED_DISKS
     [ -n "${ADMIN_PASSWORD:-}" ] && export ADMIN_PASSWORD
+    # With both answers supplied the whole install runs without an operator,
+    # so nothing must block on operator input afterwards either (see finish).
+    if [ -n "${SELECTED_DISKS:-}" ] && [ -n "${ADMIN_PASSWORD:-}" ]; then
+        SMOOTHISO_UNATTENDED=1
+    fi
 }
+SMOOTHISO_UNATTENDED=0
 parse_cmdline_automation
 
 TARGET="/mnt/target"
@@ -2825,7 +2831,25 @@ finish() {
     echo "   Username: admin"
     echo ""
 
-    if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+    if [ "$SMOOTHISO_UNATTENDED" = "1" ]; then
+        # Unattended install (smoothiso.disks= + smoothiso.password= on the
+        # kernel cmdline): nobody is present to press continue, and ui_wait
+        # would stall the install for UI_FRONTEND_TIMEOUT (30 min) and then
+        # die. Announce on the kiosk best-effort and reboot after a short
+        # countdown instead.
+        if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+            ui_write_request "notice" "Installation complete" \
+                "Your ${PRODUCT_NAME} installation is finished. Rebooting." "{}" \
+                >/dev/null 2>&1 || true
+        fi
+        local secs=10
+        while [ "$secs" -gt 0 ]; do
+            printf '\r   Unattended install complete. Rebooting in %2d seconds...' "$secs"
+            sleep 1
+            secs=$((secs - 1))
+        done
+        printf '\n\n'
+    elif [ "$UI_FRONTEND_ENABLED" = "1" ]; then
         ui_require_frontend
         ui_wait \
             "Installation complete" \
