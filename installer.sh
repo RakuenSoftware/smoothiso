@@ -2667,6 +2667,20 @@ NFT
             chmod 755 "$TARGET/usr/local/lib/smoothiso/firstboot-ext.sh"
         fi
 
+        # firstboot runs on the installed system, where this script's config
+        # is gone. Without it, firstboot falls back to PRODUCT_ID=linux and
+        # writes its done-marker under /var/lib/linux, which the unit's
+        # ConditionPathExists below never sees, so firstboot reruns on every
+        # boot. A product hook that already wrote the file keeps its own.
+        mkdir -p "$TARGET/usr/local/lib/smoothiso"
+        if [ ! -f "$TARGET/usr/local/lib/smoothiso/config.sh" ]; then
+            for kv in "PRODUCT_ID=$PRODUCT_ID" "PRODUCT_NAME=$PRODUCT_NAME" \
+                      "DATA_DIR=$DATA_DIR"; do
+                printf "%s='%s'\n" "${kv%%=*}" \
+                    "$(printf '%s' "${kv#*=}" | sed "s/'/'\\\\''/g")"
+            done > "$TARGET/usr/local/lib/smoothiso/config.sh"
+        fi
+
         cat > "$TARGET/etc/systemd/system/${PRODUCT_ID}-firstboot.service" << UNIT
 [Unit]
 Description=${PRODUCT_NAME} First Boot Setup
