@@ -9,10 +9,10 @@
 #
 # Flow:
 #   1. Environment (mount /proc /sys /dev, load modules)
-#   2. Network (DHCP with manual fallback)
-#   3. Clock sync (NTP, HTTP Date fallback)
+#   2. Network (DHCP with manual fallback; skipped when INSTALLER_NETWORK=0)
+#   3. Clock sync (NTP, HTTP Date fallback; skipped when INSTALLER_NETWORK=0)
 #   4. Disk selection (whiptail checklist)
-#   5. Password prompt
+#   5. Password prompt (then the LAN NIC, when INSTALLER_SELECT_LAN_NIC=1)
 #   6. Partition + format (single-disk LVM or RAID-1 + LVM)
 #   7. Install base system (debootstrap)
 #   8. Install packages
@@ -36,6 +36,9 @@ fi
 #                                       plus separated for RAID-1, e.g.
 #                                       smoothiso.disks=/dev/sda+/dev/sdb)
 #   smoothiso.password=hunter2          admin/root password (>= 6 chars)
+#   smoothiso.lan=net0|aa:bb:..         LAN NIC (interface name or MAC), used
+#                                       when INSTALLER_SELECT_LAN_NIC=1
+#   smoothiso.lanaddr=192.168.1.1/24    LAN address for that NIC
 #   smoothiso.auto                      marker only; install is unattended
 #                                       whenever disks+password are supplied,
 #                                       this just documents intent on the menu
@@ -55,6 +58,12 @@ parse_cmdline_automation() {
                 ;;
             smoothiso.password=*)
                 ADMIN_PASSWORD="${tok#smoothiso.password=}"
+                ;;
+            smoothiso.lan=*)
+                SELECTED_LAN_NIC="${tok#smoothiso.lan=}"
+                ;;
+            smoothiso.lanaddr=*)
+                SELECTED_LAN_ADDR="${tok#smoothiso.lanaddr=}"
                 ;;
         esac
     done
@@ -831,6 +840,136 @@ ui_prompt_password() {
     printf '%s' "$value"
 }
 
+# ============================================================
+# 3c. LAN interface
+# ============================================================
+
+# nic_summary prints a one-line description of a NIC for the picker: MAC,
+# driver and whether a cable is plugged in, which is how an operator tells
+# otherwise identical ports apart.
+nic_summary() {
+    local nic="$1" mac driver cable
+    mac=$(cat "/sys/class/net/${nic}/address" 2>/dev/null)
+    driver=$(basename "$(readlink -f "/sys/class/net/${nic}/device/driver" 2>/dev/null)" 2>/dev/null)
+    if [ "$(cat "/sys/class/net/${nic}/carrier" 2>/dev/null)" = "1" ]; then
+        cable="cable connected"
+    else
+        cable="no cable"
+    fi
+    echo "${mac}  ${driver:-unknown}  ${cable}"
+}
+
+# valid_ipv4_cidr accepts a.b.c.d/nn with octets 0-255 and a /8../30 prefix.
+valid_ipv4_cidr() {
+    echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' || return 1
+    local prefix="${1#*/}" octet
+    [ "$prefix" -ge 8 ] && [ "$prefix" -le 30 ] || return 1
+    for octet in $(echo "${1%/*}" | tr '.' ' '); do
+        [ "$octet" -le 255 ] || return 1
+    done
+}
+
+# select_lan_nic asks which NIC is the LAN port and what address it gets, for
+# products that come up serving their LAN (INSTALLER_SELECT_LAN_NIC=1). The
+# answers are exported to the hooks as SELECTED_LAN_NIC (installer-side name),
+# SELECTED_LAN_MAC and SELECTED_LAN_ADDR (CIDR); hooks should key on the MAC,
+# since the installed system renames NICs.
+select_lan_nic() {
+    [ "${INSTALLER_SELECT_LAN_NIC:-0}" = "1" ] || return 0
+    msg "LAN interface"
+
+    local nics nic
+    nics=$(physical_nics)
+    [ -n "$nics" ] || die "No network interface found for the LAN"
+    # Carrier is only reported while a link is up. Bring the links up without
+    # configuring anything so the picker can show where the cable is.
+    for nic in $nics; do
+        ip link set "$nic" up 2>/dev/null || true
+    done
+    sleep 3
+
+    if [ -n "${SELECTED_LAN_NIC:-}" ]; then
+        # Pre-set (kernel cmdline or automation): an interface name or a MAC.
+        local want found=""
+        want=$(echo "$SELECTED_LAN_NIC" | tr 'A-F' 'a-f')
+        for nic in $nics; do
+            if [ "$nic" = "$SELECTED_LAN_NIC" ] || \
+               [ "$(cat "/sys/class/net/${nic}/address" 2>/dev/null)" = "$want" ]; then
+                found="$nic"
+            fi
+        done
+        [ -n "$found" ] || die "Pre-configured LAN NIC not found: ${SELECTED_LAN_NIC}"
+        SELECTED_LAN_NIC="$found"
+    elif [ "$SMOOTHISO_UNATTENDED" = "1" ]; then
+        # No operator: the first port with a cable, else the first port.
+        for nic in $nics; do
+            if [ "$(cat "/sys/class/net/${nic}/carrier" 2>/dev/null)" = "1" ]; then
+                SELECTED_LAN_NIC="$nic"
+                break
+            fi
+        done
+        [ -n "${SELECTED_LAN_NIC:-}" ] || SELECTED_LAN_NIC=$(echo "$nics" | awk '{print $1}')
+    elif [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+        local listing="" answer
+        for nic in $nics; do
+            listing="${listing}\n${nic}: $(nic_summary "$nic")"
+        done
+        while [ -z "${SELECTED_LAN_NIC:-}" ]; do
+            answer=$(ui_prompt_text \
+                "${PRODUCT_NAME} - LAN Interface" \
+                "Which port is the LAN? You will connect to it to configure ${PRODUCT_NAME}.\n${listing}" \
+                "$(echo "$nics" | awk '{print $1}')")
+            for nic in $nics; do
+                [ "$nic" = "$answer" ] && SELECTED_LAN_NIC="$nic"
+            done
+        done
+    else
+        local choice
+        while [ -z "${SELECTED_LAN_NIC:-}" ]; do
+            set --
+            for nic in $nics; do
+                set -- "$@" "$nic" "$(nic_summary "$nic")"
+            done
+            set -- "$@" "rescan" "Re-check which ports have a cable"
+            choice=$(run_whiptail \
+                --title "${PRODUCT_NAME} - LAN Interface" \
+                --menu "Which port is the LAN? You will plug a computer into it to configure ${PRODUCT_NAME}. Plug the cable in and pick Re-check to see which port it is." \
+                20 78 10 "$@") || choice=""
+            case "$choice" in
+                ""|rescan) sleep 1 ;;
+                *) SELECTED_LAN_NIC="$choice" ;;
+            esac
+        done
+    fi
+    SELECTED_LAN_MAC=$(cat "/sys/class/net/${SELECTED_LAN_NIC}/address")
+
+    if [ -n "${SELECTED_LAN_ADDR:-}" ]; then
+        valid_ipv4_cidr "$SELECTED_LAN_ADDR" || \
+            die "Pre-configured LAN address is not a valid IPv4 CIDR: ${SELECTED_LAN_ADDR}"
+    elif [ "$SMOOTHISO_UNATTENDED" = "1" ]; then
+        SELECTED_LAN_ADDR="${INSTALLER_LAN_DEFAULT_ADDR:-192.168.1.1/24}"
+    else
+        local addr=""
+        while ! valid_ipv4_cidr "$addr"; do
+            if [ "$UI_FRONTEND_ENABLED" = "1" ]; then
+                addr=$(ui_prompt_text \
+                    "${PRODUCT_NAME} - LAN Address" \
+                    "Address of ${PRODUCT_NAME} on the LAN (CIDR). Computers on the LAN get addresses from it by DHCP." \
+                    "${INSTALLER_LAN_DEFAULT_ADDR:-192.168.1.1/24}")
+            else
+                addr=$(run_whiptail \
+                    --title "${PRODUCT_NAME} - LAN Address" \
+                    --inputbox "Address of ${PRODUCT_NAME} on the LAN (CIDR, e.g. 192.168.1.1/24). Computers on the LAN get addresses from it by DHCP." \
+                    10 78 "${INSTALLER_LAN_DEFAULT_ADDR:-192.168.1.1/24}") || addr=""
+            fi
+        done
+        SELECTED_LAN_ADDR="$addr"
+    fi
+
+    export SELECTED_LAN_NIC SELECTED_LAN_MAC SELECTED_LAN_ADDR
+    echo "  LAN: ${SELECTED_LAN_NIC} (${SELECTED_LAN_MAC}) at ${SELECTED_LAN_ADDR}"
+}
+
 ui_prompt_checklist() {
     [ "$UI_FRONTEND_ENABLED" = "1" ] || return 1
 
@@ -1171,13 +1310,11 @@ setup_env() {
 # 2. Networking
 # ============================================================
 
-setup_network() {
-    msg "Configuring network"
-
-    local ifaces=""
-    local iface_count=0
+# physical_nics prints the installer's physical NICs, space-separated.
+physical_nics() {
+    local ifaces="" dev name
     for dev in /sys/class/net/*; do
-        local name=$(basename "$dev")
+        name=$(basename "$dev")
         [ "$name" = "lo" ] && continue
         # Only consider real NICs. The installer ramdisk loads modules that
         # create virtual interfaces (dummy0, ifb0/ifb1, eql, ...); none of them
@@ -1187,24 +1324,36 @@ setup_network() {
         # backing PCI/USB device; virtual ones do not.
         [ -e "$dev/device" ] || continue
         ifaces="$ifaces $name"
-        iface_count=$((iface_count + 1))
     done
-    ifaces=$(echo "$ifaces" | sed 's/^ //')
 
     # Fall back to all non-loopback interfaces if the device-link filter found
     # nothing (some exotic NIC drivers don't expose the link) so we never strand
     # an install with no network to probe.
     if [ -z "$ifaces" ]; then
         for dev in /sys/class/net/*; do
-            local name=$(basename "$dev")
+            name=$(basename "$dev")
             [ "$name" = "lo" ] && continue
             ifaces="$ifaces $name"
-            iface_count=$((iface_count + 1))
         done
-        ifaces=$(echo "$ifaces" | sed 's/^ //')
+    fi
+    echo "$ifaces" | sed 's/^ //'
+}
+
+setup_network() {
+    msg "Configuring network"
+
+    if [ "${INSTALLER_NETWORK:-1}" = "0" ]; then
+        # Everything comes from the install medium; never touch the network.
+        ip link set lo up 2>/dev/null || true
+        echo "  Installer networking disabled; installing from the install medium."
+        return 0
     fi
 
+    local ifaces
+    ifaces=$(physical_nics)
     [ -z "$ifaces" ] && die "No network interface found"
+    local iface_count
+    iface_count=$(echo "$ifaces" | wc -w)
 
     echo "  Found $iface_count interface(s): $ifaces"
     echo "  Bringing interfaces up..."
@@ -1347,6 +1496,7 @@ setup_network() {
 
 install_browser_deferred() {
     [ "${INSTALLER_BROWSER_DEFERRED:-0}" = "1" ] || return 0
+    [ "${INSTALLER_NETWORK:-1}" = "0" ] && return 0
     local browser_pkg="${INSTALLER_BROWSER_PKG:-firefox-esr}"
     local aux_pkgs="${INSTALLER_BROWSER_AUX_PKGS:-xvfb xinit x11-utils x11-xserver-utils xserver-xorg-core xserver-xorg-input-libinput xserver-xorg-input-evdev xserver-xorg-video-fbdev xserver-xorg-video-vesa xserver-xorg-video-qxl xserver-xorg-video-all xserver-xorg-input-all xfonts-base xfonts-100dpi xfonts-75dpi libegl1 dbus dbus-x11 firmware-linux-free}"
 
@@ -1380,6 +1530,10 @@ install_browser_deferred() {
 
 sync_clock() {
     msg "Syncing system clock"
+    if [ "${INSTALLER_NETWORK:-1}" = "0" ]; then
+        echo "  Installer networking disabled; keeping the hardware clock: $(date -u)"
+        return 0
+    fi
     local clock_tmpdir
     local clock_pid
     local clock_wait=0
@@ -1946,14 +2100,16 @@ EOF
 OFFLINE_DIR=""
 
 # mount_offline_pool locates and mounts the installation ISO (read-only) and, if
-# it carries an offline package pool, points OFFLINE_DIR at it. Best-effort:
-# any failure just leaves OFFLINE_DIR empty and the install proceeds online.
+# it carries the offline repositories (see build_offline_pool), points
+# OFFLINE_DIR at them. Without them the install proceeds online — unless the
+# installer has networking disabled, in which case there is nothing to install
+# from and that is fatal.
 mount_offline_pool() {
     [ -n "$OFFLINE_DIR" ] && return 0
     # d-i may already have the media mounted; check the usual spots first.
     local cand
     for cand in /cdrom /run/smoothiso-cdrom /media/cdrom /media/cdrom0 /run/live/medium; do
-        [ -d "$cand/offline/base-cache" ] && {
+        [ -f "$cand/offline/base/dists/${DEBIAN_SUITE}/Release" ] && {
             OFFLINE_DIR="$cand/offline"
             echo "  Offline package pool found: $OFFLINE_DIR"
             return 0
@@ -1972,14 +2128,17 @@ mount_offline_pool() {
                /dev/sr0 /dev/sr1 /dev/cdrom $(ls /dev/sr* 2>/dev/null); do
         [ -b "$dev" ] || continue
         mount -o ro "$dev" "$mnt" 2>/dev/null || continue
-        if [ -d "$mnt/offline/base-cache" ]; then
+        if [ -f "$mnt/offline/base/dists/${DEBIAN_SUITE}/Release" ]; then
             OFFLINE_DIR="$mnt/offline"
             echo "  Offline package pool found: $OFFLINE_DIR (mounted $dev)"
             return 0
         fi
         umount "$mnt" 2>/dev/null || true
     done
-    echo "  No offline package pool on the install medium; downloading base over the network."
+    if [ "${INSTALLER_NETWORK:-1}" = "0" ]; then
+        die "The package repository on the install medium was not found. Re-write the installer image and try again."
+    fi
+    echo "  No offline package pool on the install medium; downloading over the network."
     return 0
 }
 
@@ -1989,23 +2148,19 @@ install_base() {
     command -v debootstrap >/dev/null 2>&1 || \
         die "debootstrap not found in initrd -- rebuild ISO"
 
-    # Use the on-ISO base cache when available. debootstrap --cache-dir uses a
-    # cached .deb only when it matches the mirror's current version and fetches
-    # the rest over the network, so this is a pure speedup with per-package
-    # network fallback. Guarded on the flag being supported by this debootstrap.
-    local cache_args=""
+    # Bootstrap from the install medium when it carries the offline base
+    # repository, so the base system needs no network at all.
+    local mirror="$DEBIAN_MIRROR"
     mount_offline_pool
-    if [ -n "$OFFLINE_DIR" ] && [ -d "$OFFLINE_DIR/base-cache" ] && \
-       debootstrap --help 2>&1 | grep -q -- '--cache-dir'; then
-        cache_args="--cache-dir=$OFFLINE_DIR/base-cache"
-        echo "  Using offline base cache ($(find "$OFFLINE_DIR/base-cache" -name '*.deb' | wc -l) packages)."
+    if [ -n "$OFFLINE_DIR" ]; then
+        mirror="file://${OFFLINE_DIR}/base"
+        echo "  Installing the base system from the install medium."
     fi
 
     ui_status "Installing base system" "Running debootstrap first stage (Debian ${DEBIAN_SUITE}). This takes a few minutes." 2 6
     echo "  Running debootstrap for ${DEBIAN_SUITE}..."
-    # shellcheck disable=SC2086
-    debootstrap --foreign --arch="$ARCH" $cache_args \
-        "$DEBIAN_SUITE" "$TARGET" "$DEBIAN_MIRROR" || \
+    debootstrap --foreign --arch="$ARCH" \
+        "$DEBIAN_SUITE" "$TARGET" "$mirror" || \
         die "debootstrap first stage failed"
 
     # Stub postinsts that source debconf confmodule -- they hang in the
@@ -2181,6 +2336,29 @@ DPKGCFG
 Acquire::Languages "none";
 Acquire::http::Pipeline-Depth "10";
 APTCFG
+    # With the offline repository on the install medium, apt reads only that
+    # for the rest of the install: it is bind-mounted into the target and the
+    # source list is redirected to it by the same apt.conf.d file that is
+    # removed at the end of install_packages. sources.list above stays as the
+    # installed system's real configuration, and source files hooks add to
+    # sources.list.d are written but not consulted until after the install.
+    # Hooks see the chroot path in SMOOTHISO_OFFLINE_REPO.
+    SMOOTHISO_OFFLINE_REPO=""
+    if [ -n "$OFFLINE_DIR" ]; then
+        SMOOTHISO_OFFLINE_REPO="/media/smoothiso-offline"
+        mkdir -p "$TARGET$SMOOTHISO_OFFLINE_REPO" "$TARGET/etc/apt/smoothiso-offline.list.d"
+        mount --bind "$OFFLINE_DIR/repo" "$TARGET$SMOOTHISO_OFFLINE_REPO" || \
+            die "Failed to mount the offline package repository"
+        echo "deb [trusted=yes] file:${SMOOTHISO_OFFLINE_REPO} ${DEBIAN_SUITE} main" \
+            > "$TARGET/etc/apt/smoothiso-offline.list"
+        cat >> "$TARGET/etc/apt/apt.conf.d/99smoothiso-install-speed" << APTCFG
+Dir::Etc::SourceList "/etc/apt/smoothiso-offline.list";
+Dir::Etc::SourceParts "/etc/apt/smoothiso-offline.list.d";
+APTCFG
+        echo "  Installing packages from the install medium."
+    fi
+    export SMOOTHISO_OFFLINE_REPO
+
     cat > "$TARGET/tmp/smoothiso-stub-debconf" << 'HOOK'
 #!/bin/sh
 for f in /var/lib/dpkg/info/*.postinst; do
@@ -2321,6 +2499,13 @@ HOOK
     # Cleanup hooks and stubs.
     rm -f "$TARGET/etc/dpkg/dpkg.cfg.d/smoothiso-install"
     rm -f "$TARGET/etc/apt/apt.conf.d/99smoothiso-install-speed"
+    if [ -n "$SMOOTHISO_OFFLINE_REPO" ]; then
+        umount "$TARGET$SMOOTHISO_OFFLINE_REPO" 2>/dev/null || true
+        rmdir "$TARGET$SMOOTHISO_OFFLINE_REPO" 2>/dev/null || true
+        rm -rf "$TARGET/etc/apt/smoothiso-offline.list" \
+               "$TARGET/etc/apt/smoothiso-offline.list.d" \
+               "$TARGET"/var/lib/apt/lists/*smoothiso-offline*
+    fi
     rm -f "$TARGET/tmp/smoothiso-stub-debconf"
     if [ -f "$TARGET/usr/sbin/dpkg-preconfigure.real" ]; then
         mv "$TARGET/usr/sbin/dpkg-preconfigure.real" \
@@ -2909,6 +3094,7 @@ select_language
 sync_clock
 select_disks
 prompt_password
+select_lan_nic
 
 ui_status "Partitioning disks" "Wiping and partitioning the selected disks." 1 6
 do_partitioning
