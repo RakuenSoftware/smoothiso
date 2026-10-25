@@ -90,6 +90,9 @@
 #   OFFLINE_APT_SOURCES  Optional file of extra apt source lines used when
 #       resolving OFFLINE_EXTRA_PACKAGES. Any signed-by= keyring it names must
 #       exist on the build host.
+#   OFFLINE_APT_PREFERENCES  Optional apt preferences file applied when
+#       resolving the offline package set, e.g. to pin a package out so it
+#       never enters the repository.
 #   OFFLINE_DEBIAN_KEYRING  Keyring used to verify the Debian mirror while
 #       assembling the offline repository. Default
 #       /usr/share/keyrings/debian-archive-keyring.gpg.
@@ -1396,6 +1399,9 @@ deb [signed-by=${keyring}] http://security.debian.org/debian-security ${DEBIAN_S
 SOURCES
     if [ -n "${OFFLINE_APT_SOURCES:-}" ]; then
         cp "$OFFLINE_APT_SOURCES" "$aptroot/etc/apt/sources.list.d/offline-extra.list"
+    fi
+    if [ -n "${OFFLINE_APT_PREFERENCES:-}" ]; then
+        cp "$OFFLINE_APT_PREFERENCES" "$aptroot/etc/apt/preferences.d/offline-extra"
     fi
     local -a apt_opts=(
         -o Dir::Etc="$aptroot/etc/apt"
