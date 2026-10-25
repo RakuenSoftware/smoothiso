@@ -67,6 +67,32 @@
 #       module names to stage from the full linux-image package matching the
 #       Debian installer kernel. Dependencies and modules.* metadata are
 #       included automatically. Example: "amdgpu radeon"
+#   INSTALLER_FIRMWARE_PACKAGES  Firmware packages installed on the target.
+#       Default "firmware-linux firmware-amd-graphics firmware-intel-graphics".
+#   INSTALLER_NETWORK  Set to 0 for an installer that never touches the
+#       network: no DHCP probing, no clock sync, no deferred browser download.
+#       Requires SMOOTHISO_OFFLINE=1 so every package comes from the ISO.
+#       Default 1.
+#   INSTALLER_SELECT_LAN_NIC  Set to 1 to ask the operator which NIC is the
+#       LAN port and what address it should have (default address
+#       INSTALLER_LAN_DEFAULT_ADDR, "192.168.1.1/24"). The answers are exported
+#       to hooks as SELECTED_LAN_NIC / SELECTED_LAN_MAC / SELECTED_LAN_ADDR.
+#       Unattended installs take them from smoothiso.lan=<name|mac> and
+#       smoothiso.lanaddr=<cidr> on the kernel command line.
+#   SMOOTHISO_OFFLINE  Set to 1 to put a complete package repository on the
+#       ISO so the install needs no network: the Debian base system, every
+#       package installer.sh installs, plus the extras below. The build fails
+#       if the repository cannot be assembled.
+#   OFFLINE_EXTRA_PACKAGES  Additional package names (with dependencies) for
+#       the offline repository, e.g. what the project's packages.sh installs.
+#   OFFLINE_EXTRA_DEBS  Space-separated paths of local .deb files to add to
+#       the offline repository (e.g. a project-built kernel).
+#   OFFLINE_APT_SOURCES  Optional file of extra apt source lines used when
+#       resolving OFFLINE_EXTRA_PACKAGES. Any signed-by= keyring it names must
+#       exist on the build host.
+#   OFFLINE_DEBIAN_KEYRING  Keyring used to verify the Debian mirror while
+#       assembling the offline repository. Default
+#       /usr/share/keyrings/debian-archive-keyring.gpg.
 #
 # Hook interface (all optional — absence is not an error):
 #   $HOOKS_DIR/embed.sh
@@ -104,6 +130,12 @@ SMOOTHGUI_FRONTEND_DIR="${SMOOTHGUI_FRONTEND_DIR:-}"
 SMOOTHGUI_FRONTEND_REQUIRED="${SMOOTHGUI_FRONTEND_REQUIRED:-1}"
 SMOOTHGUI_FRONTEND_PORT="${SMOOTHGUI_FRONTEND_PORT:-8080}"
 SMOOTHGUI_FRONTEND_BIND="${SMOOTHGUI_FRONTEND_BIND:-0.0.0.0}"
+INSTALLER_NETWORK="${INSTALLER_NETWORK:-1}"
+SMOOTHISO_OFFLINE="${SMOOTHISO_OFFLINE:-0}"
+if [ "$INSTALLER_NETWORK" = "0" ] && [ "$SMOOTHISO_OFFLINE" != "1" ]; then
+    echo "ERROR: INSTALLER_NETWORK=0 requires SMOOTHISO_OFFLINE=1 (nothing to install from otherwise)." >&2
+    exit 1
+fi
 _INSTALLER_KERNEL_KVER=""
 _INSTALLER_KERNEL_MODULES_STAGE=""
 
@@ -125,6 +157,19 @@ case "$ARCH" in
         exit 1
         ;;
 esac
+
+# Target package sets for the offline repository (build_offline_pool). The
+# bootloader and core lists must match install_packages in installer.sh; the
+# rest are written into the installer's config.sh so both sides share them.
+case "$ARCH" in
+    amd64) INSTALLER_BOOTLOADER_PACKAGES="grub-efi-amd64 grub-pc-bin efibootmgr" ;;
+    arm64) INSTALLER_BOOTLOADER_PACKAGES="grub-efi-arm64 efibootmgr" ;;
+esac
+INSTALLER_CORE_PACKAGES="lvm2 mdadm openssh-server sudo curl wget ca-certificates systemd-timesyncd systemd-resolved"
+INSTALLER_FIRMWARE_PACKAGES="${INSTALLER_FIRMWARE_PACKAGES-firmware-linux firmware-amd-graphics firmware-intel-graphics}"
+INSTALLER_KERNEL_PACKAGES="${INSTALLER_KERNEL_PACKAGES-linux-image-${ARCH} linux-headers-${ARCH}}"
+INSTALLER_FILESYSTEM_PACKAGES="${INSTALLER_FILESYSTEM_PACKAGES-btrfs-progs}"
+INSTALLER_OPTIONAL_FILESYSTEM_PACKAGES="${INSTALLER_OPTIONAL_FILESYSTEM_PACKAGES-bcachefs-tools}"
 
 DEBIAN_ISO_URL="https://cdimage.debian.org/debian-cd/current/${ARCH}/iso-cd/"
 
@@ -1146,9 +1191,14 @@ SMOOTHGUI_FRONTEND_DIR="${_initrd_frontend_dir}"
 SMOOTHGUI_FRONTEND_REQUIRED="${SMOOTHGUI_FRONTEND_REQUIRED:-1}"
 SMOOTHGUI_FRONTEND_PORT="${SMOOTHGUI_FRONTEND_PORT:-8080}"
 SMOOTHGUI_FRONTEND_BIND="${SMOOTHGUI_FRONTEND_BIND:-0.0.0.0}"
-INSTALLER_KERNEL_PACKAGES="${INSTALLER_KERNEL_PACKAGES-linux-image-${ARCH} linux-headers-${ARCH}}"
-INSTALLER_FILESYSTEM_PACKAGES="${INSTALLER_FILESYSTEM_PACKAGES-btrfs-progs}"
-INSTALLER_OPTIONAL_FILESYSTEM_PACKAGES="${INSTALLER_OPTIONAL_FILESYSTEM_PACKAGES-bcachefs-tools}"
+INSTALLER_FIRMWARE_PACKAGES="${INSTALLER_FIRMWARE_PACKAGES}"
+INSTALLER_KERNEL_PACKAGES="${INSTALLER_KERNEL_PACKAGES}"
+INSTALLER_FILESYSTEM_PACKAGES="${INSTALLER_FILESYSTEM_PACKAGES}"
+INSTALLER_OPTIONAL_FILESYSTEM_PACKAGES="${INSTALLER_OPTIONAL_FILESYSTEM_PACKAGES}"
+INSTALLER_NETWORK="${INSTALLER_NETWORK}"
+INSTALLER_SELECT_LAN_NIC="${INSTALLER_SELECT_LAN_NIC:-0}"
+INSTALLER_LAN_DEFAULT_ADDR="${INSTALLER_LAN_DEFAULT_ADDR:-192.168.1.1/24}"
+SMOOTHISO_OFFLINE="${SMOOTHISO_OFFLINE}"
 BCACHEFS_APT_CODENAME="${BCACHEFS_APT_CODENAME:-}"
 BCACHEFS_APT_SUITE="${BCACHEFS_APT_SUITE:-bcachefs-tools-release}"
 INSTALLER_BROWSER_DEFERRED="${INSTALLER_BROWSER_DEFERRED:-0}"
@@ -1280,51 +1330,148 @@ EOF
 
 # --- Repack ISO ---
 
-# build_offline_pool stages the Debian base-system .debs onto the ISO so the
-# installer can debootstrap from a local cache instead of pulling every base
-# package over the network — the dominant cost of an install. It is opt-in
-# (SMOOTHISO_OFFLINE=1) and best-effort: if anything here fails the pool is
-# simply absent and the installer downloads as before. The packages are placed
-# in $WORK_DIR/offline/base-cache and consumed at install time via
-# `debootstrap --cache-dir`, which falls back to the network per package, so a
-# stale or partial cache can never break an install.
+# build_offline_pool puts a self-contained package repository on the ISO so an
+# install needs no network at all. It is opt-in (SMOOTHISO_OFFLINE=1) and,
+# once requested, mandatory: any failure aborts the build rather than shipping
+# an ISO that silently depends on the network. Two repositories are written,
+# both in the standard dists/<suite>/main/binary-<arch> layout:
+#
+#   offline/base  the debootstrap mirror — exactly the base system debootstrap
+#                 resolves, one version per package (debootstrap reads the
+#                 first stanza it sees, so this one must not carry two).
+#   offline/repo  the apt repository for everything installed afterwards: the
+#                 full dependency closure of every package installer.sh and
+#                 the project's hooks install, plus OFFLINE_EXTRA_DEBS.
+#
+# The closure is resolved against an empty dpkg status, so it is a superset of
+# whatever the freshly bootstrapped target turns out to need.
 build_offline_pool() {
-    [ "${SMOOTHISO_OFFLINE:-0}" = "1" ] || return 0
-    echo "Building offline package pool..."
+    [ "$SMOOTHISO_OFFLINE" = "1" ] || return 0
+    echo "Building offline package repository..."
 
-    if ! command -v debootstrap >/dev/null 2>&1; then
-        echo "  WARNING: debootstrap not on build host; skipping offline base cache."
-        return 0
+    local tool
+    for tool in debootstrap apt-get dpkg-scanpackages apt-ftparchive; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo "ERROR: SMOOTHISO_OFFLINE=1 needs ${tool} on the build host." >&2
+            exit 1
+        fi
+    done
+    local keyring="${OFFLINE_DEBIAN_KEYRING:-/usr/share/keyrings/debian-archive-keyring.gpg}"
+    if [ ! -f "$keyring" ]; then
+        echo "ERROR: Debian archive keyring not found: ${keyring} (install debian-archive-keyring)." >&2
+        exit 1
     fi
 
     local off="${WORK_DIR}/offline"
-    local base_cache="${off}/base-cache"
-    mkdir -p "$base_cache"
+    local scratch
+    scratch=$(mktemp -d)
+    rm -rf "$off"
+    mkdir -p "$off/base/pool" "$off/repo/pool"
 
-    # --download-only fetches the base .debs without unpacking a chroot, so it
-    # does not require root. Point its cache at base_cache; some debootstrap
-    # versions stage debs under <target>/var/cache/apt/archives instead, so we
-    # sweep both into base_cache afterwards.
-    local dbtmp
-    dbtmp=$(mktemp -d)
+    # --- Base system (debootstrap) ---
     echo "  Downloading ${DEBIAN_SUITE}/${ARCH} base system..."
-    if debootstrap --download-only --arch="$ARCH" \
-            --cache-dir="$base_cache" \
-            "$DEBIAN_SUITE" "$dbtmp" "$DEBIAN_MIRROR" >/dev/null 2>&1; then
-        find "$dbtmp" -name '*.deb' -exec cp -n {} "$base_cache/" \; 2>/dev/null || true
-        local n
-        n=$(find "$base_cache" -name '*.deb' | wc -l)
-        if [ "$n" -gt 0 ]; then
-            echo "  Offline base cache: ${n} packages ($(du -sh "$base_cache" 2>/dev/null | cut -f1))."
-        else
-            echo "  WARNING: base cache empty; installer will download the base over the network."
-            rm -rf "$off"
-        fi
-    else
-        echo "  WARNING: base download failed; installer will download the base over the network."
-        rm -rf "$off"
+    mkdir -p "$scratch/dbs" "$scratch/dbs-cache"
+    if ! debootstrap --download-only --arch="$ARCH" --keyring="$keyring" \
+            --cache-dir="$scratch/dbs-cache" \
+            "$DEBIAN_SUITE" "$scratch/dbs" "$DEBIAN_MIRROR" >"$scratch/dbs.log" 2>&1; then
+        tail -n 20 "$scratch/dbs.log" >&2
+        echo "ERROR: downloading the base system failed." >&2
+        exit 1
     fi
-    rm -rf "$dbtmp"
+    find "$scratch/dbs-cache" "$scratch/dbs" -name '*.deb' -exec cp -n {} "$off/base/pool/" \;
+
+    # --- Everything installed after debootstrap (apt) ---
+    # A private apt state directory, so the build host's own sources, pins and
+    # dpkg status never leak into the result.
+    local aptroot="$scratch/apt"
+    mkdir -p "$aptroot/etc/apt/sources.list.d" "$aptroot/etc/apt/preferences.d" \
+             "$aptroot/etc/apt/apt.conf.d" "$aptroot/etc/apt/trusted.gpg.d" \
+             "$aptroot/var/lib/apt/lists/partial" \
+             "$aptroot/var/cache/apt/archives/partial" "$aptroot/var/lib/dpkg"
+    : > "$aptroot/var/lib/dpkg/status"
+    cat > "$aptroot/etc/apt/sources.list" << SOURCES
+deb [signed-by=${keyring}] ${DEBIAN_MIRROR} ${DEBIAN_SUITE} main contrib non-free-firmware
+deb [signed-by=${keyring}] ${DEBIAN_MIRROR} ${DEBIAN_SUITE}-updates main contrib non-free-firmware
+deb [signed-by=${keyring}] http://security.debian.org/debian-security ${DEBIAN_SUITE}-security main contrib non-free-firmware
+SOURCES
+    if [ -n "${OFFLINE_APT_SOURCES:-}" ]; then
+        cp "$OFFLINE_APT_SOURCES" "$aptroot/etc/apt/sources.list.d/offline-extra.list"
+    fi
+    local -a apt_opts=(
+        -o Dir::Etc="$aptroot/etc/apt"
+        -o Dir::State="$aptroot/var/lib/apt"
+        -o Dir::State::status="$aptroot/var/lib/dpkg/status"
+        -o Dir::Cache="$aptroot/var/cache/apt"
+        -o APT::Architecture="$ARCH"
+        -o APT::Architectures::="$ARCH"
+        -o APT::Sandbox::User=root
+        -o Debug::NoLocking=1
+        -o Acquire::Languages=none
+    )
+    echo "  Refreshing package indexes..."
+    if ! apt-get "${apt_opts[@]}" update -qq >"$scratch/apt.log" 2>&1 || \
+       grep -q '^[EW]: Failed to fetch' "$scratch/apt.log"; then
+        cat "$scratch/apt.log" >&2
+        echo "ERROR: apt-get update for the offline repository failed." >&2
+        exit 1
+    fi
+
+    local required_pkgs="${INSTALLER_BOOTLOADER_PACKAGES} ${INSTALLER_CORE_PACKAGES} ${INSTALLER_FIRMWARE_PACKAGES} ${INSTALLER_KERNEL_PACKAGES} ${INSTALLER_FILESYSTEM_PACKAGES} ${OFFLINE_EXTRA_PACKAGES:-}"
+    echo "  Resolving packages:" $required_pkgs
+    # shellcheck disable=SC2086
+    if ! DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y -qq \
+            --download-only $required_pkgs >"$scratch/apt.log" 2>&1; then
+        cat "$scratch/apt.log" >&2
+        echo "ERROR: could not download the offline package set." >&2
+        exit 1
+    fi
+    # Optional packages mirror installer.sh: install them if available, never
+    # fail on them.
+    local pkg
+    for pkg in $INSTALLER_OPTIONAL_FILESYSTEM_PACKAGES; do
+        DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y -qq \
+            --download-only "$pkg" >/dev/null 2>&1 || \
+            echo "  Optional package ${pkg} unavailable; not included."
+    done
+
+    # Store each deb under its canonical name: apt's cache encodes an epoch as
+    # "%3a", which a file: URI would decode back to ":" and then not find.
+    local deb
+    for deb in "$aptroot"/var/cache/apt/archives/*.deb ${OFFLINE_EXTRA_DEBS:-}; do
+        [ -f "$deb" ] || { echo "ERROR: offline package not found: ${deb}" >&2; exit 1; }
+        local name ver arch
+        name=$(dpkg-deb -f "$deb" Package)
+        ver=$(dpkg-deb -f "$deb" Version)
+        arch=$(dpkg-deb -f "$deb" Architecture)
+        cp "$deb" "$off/repo/pool/${name}_${ver#*:}_${arch}.deb"
+    done
+
+    offline_index_repo "$off/base" ""
+    offline_index_repo "$off/repo" "--multiversion"
+    rm -rf "$scratch"
+
+    echo "  Offline base: $(find "$off/base/pool" -name '*.deb' | wc -l) packages, $(du -sh "$off/base" | cut -f1)."
+    echo "  Offline repo: $(find "$off/repo/pool" -name '*.deb' | wc -l) packages, $(du -sh "$off/repo" | cut -f1)."
+}
+
+# offline_index_repo writes Packages and an (unsigned) Release for one offline
+# repository. The repository is only ever read from the read-only install
+# medium the installer booted from, which is the trust anchor here.
+offline_index_repo() {
+    local root="$1" multiversion="$2"
+    local bin="dists/${DEBIAN_SUITE}/main/binary-${ARCH}"
+    mkdir -p "$root/$bin"
+    # shellcheck disable=SC2086
+    (cd "$root" && dpkg-scanpackages $multiversion pool /dev/null > "$bin/Packages" 2>/dev/null)
+    gzip -9kf "$root/$bin/Packages"
+    apt-ftparchive \
+        -o APT::FTPArchive::Release::Origin=smoothiso \
+        -o APT::FTPArchive::Release::Suite="$DEBIAN_SUITE" \
+        -o APT::FTPArchive::Release::Codename="$DEBIAN_SUITE" \
+        -o APT::FTPArchive::Release::Architectures="$ARCH" \
+        -o APT::FTPArchive::Release::Components=main \
+        release "$root/dists/${DEBIAN_SUITE}" > "$root/Release.tmp"
+    mv "$root/Release.tmp" "$root/dists/${DEBIAN_SUITE}/Release"
 }
 
 repack_iso() {
