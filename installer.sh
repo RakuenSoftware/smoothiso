@@ -2661,6 +2661,10 @@ LINK
         idx=$((idx + 1))
     done
 
+    # ClientIdentifier=mac: networkd's default identifies the client by a
+    # DUID with a per-interface IAID, so a product that later moves the NIC's
+    # config elsewhere (SmoothNAS bonds it) would look like a new client and
+    # be leased a new address. By MAC, the same NIC keeps its lease.
     cat > "$TARGET/etc/systemd/network/10-dhcp.network" << 'NETCFG'
 [Match]
 Type=ether
@@ -2668,6 +2672,9 @@ Type=ether
 [Network]
 DHCP=yes
 IPv6AcceptRA=yes
+
+[DHCPv4]
+ClientIdentifier=mac
 NETCFG
 
     # RAID config.
